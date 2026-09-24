@@ -28,11 +28,14 @@ comparison with zero logit difference and zero KL. The combined unroll-4 plus
 fusion stack is described as bitwise equivalent in its experiment results, but
 there is no separate `0009b` model-correctness artifact in this snapshot.
 
-The bundled fork includes an OpenAI-compatible server, but this checkpoint on
-this GPU has not yet passed an endpoint startup and request smoke test in this
-project. Server behavior, public hosting readiness, and server throughput are
-therefore unverified. The documented `EXL3_GEMV=0` fallback also reaches a
-gfx1201 cooperative-GEMM trap; it needs a fix or a clear scope restriction
-before claiming reliable fallback behavior.
+The bundled fork includes an OpenAI-compatible server (`tools/serve.py`).
+Endpoint startup and `/health` pass, but on 2026-09-24 the first chat request
+**faulted the GPU on gfx1201** (`HSA_STATUS_ERROR_EXCEPTION`, reproduced 2/2 in
+both authentication modes) inside the fork's server generation path. Serving is
+therefore **not usable on this GPU** pending a fix; direct-model generation via
+`bench/` is unaffected by the same fault. Server behavior, public hosting
+readiness, and server throughput remain unverified. The documented
+`EXL3_GEMV=0` fallback also reaches a gfx1201 cooperative-GEMM trap; it needs a
+fix or a clear scope restriction before claiming reliable fallback behavior.
 
 For follow-on work and the validation gates, see [optimization scope](OPTIMIZATION.md).

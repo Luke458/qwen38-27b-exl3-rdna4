@@ -54,6 +54,12 @@ not make every upstream experimental environment switch safe.
 
 ## Troubleshooting
 
+- **gfx1201 hardware exception on the first chat request (known issue,
+  2026-09-24):** the fork's server generation path raises
+  `HSA_STATUS_ERROR_EXCEPTION` while direct-model generation is unaffected.
+  Bisect handles: `--backend baseline` (fork-level vs local kernels),
+  `EXL3_ROCM_FORCE_TORCH=1` (bypass the BC/libtorch entries), `EXL3_BC_ATTN=0`
+  (attention family).
 - Build errors: confirm ROCm 7.2.4, the ROCm PyTorch wheel, Python 3.12, and a
   `gfx1201` target. Do not replace ROCm PyTorch with a CUDA wheel.
 - Out of memory: stop other GPU workloads; do not raise batch/chunk/cache sizes.

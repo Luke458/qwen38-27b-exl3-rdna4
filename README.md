@@ -49,6 +49,11 @@ The endpoint is **`http://127.0.0.1:8000/v1`**; model ID is
 256-token prefill chunks, 2048-token response cap, thinking disabled. The first
 request may compile additional kernels. Stop with Ctrl-C.
 
+> **Known issue (gfx1201, 2026-09-24):** the first chat request currently
+> raises a GPU hardware exception in the fork's server generation path (see
+> [docs/STATUS.md](docs/STATUS.md)); direct-model generation via `bench/` is
+> unaffected.
+
 In another terminal:
 
 ```bash
