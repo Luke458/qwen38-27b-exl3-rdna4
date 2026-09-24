@@ -29,15 +29,16 @@ fusion stack is described as bitwise equivalent in its experiment results, but
 there is no separate `0009b` model-correctness artifact in this snapshot.
 
 The bundled fork includes an OpenAI-compatible server (`tools/serve.py`).
-Endpoint startup and `/health` pass, but on 2026-09-24 the first chat request
-**faulted the GPU on gfx1201** (`HSA_STATUS_ERROR_EXCEPTION`, reproduced 2/2 in
-both authentication modes, and again with the frozen baseline binary — so this
-is a fork-level defect and the local kernel work is exonerated) inside the
-fork's server generation path (paged-KV/GDN generator entries). Serving is
-therefore **not usable on this GPU** pending a fix; direct-model generation via
-`bench/` is unaffected by the same fault. Server behavior, public hosting
-readiness, and server throughput remain unverified. The documented
-`EXL3_GEMV=0` fallback also reaches a gfx1201 cooperative-GEMM trap; it needs a
-fix or a clear scope restriction before claiming reliable fallback behavior.
+Endpoint startup and an end-to-end request smoke pass on this GPU as of
+2026-09-24 (`tools/smoke_api.py`: health, models, non-streaming chat with token
+usage, streaming chat with `[DONE]`, API-key rejection — 2/2 runs, with and
+without `EXL3_API_KEY`). An earlier GPU fault in the server's first request
+(`HSA_STATUS_ERROR_EXCEPTION`, reproduced on the frozen baseline binary) was
+root-caused to the fork's WMMA-gfx11 GEMM trapping on gfx12 and is fixed by
+`patches/0002-wmma-gfx12-asm.patch`: a `v_wmma_f16_16x16x16_f16` inline-asm
+port whose multi-row GEMM agrees with the oracle-exact GEMV path to ~0.1%
+normalized error. The same fix resolves the `EXL3_GEMV=0` fallback trap. Server
+throughput and public hosting readiness remain unverified (one active sequence
+by design).
 
 For follow-on work and the validation gates, see [optimization scope](OPTIMIZATION.md).

@@ -19,20 +19,24 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 PIN = "311ff5497237a37bea18cf24aa18bc0c573d1d03"
 UPSTREAM = "https://github.com/CarouselAether/rocm_exl3.git"
+Q = "exllamav3/exllamav3_ext/rocm/quant/"
+R = "exllamav3/exllamav3_ext/rocm/"
 PATCHES = {
     "baseline": (
         ("0000-smem-budget-clamp.patch", "d0100bff3f76aaf52a274f9b64ca4b177a59fd75b17b9c28d8fcc2a95ab85181"),
         ("0001-int8-port-gfx1201-compat.patch", "440239ea93feb866b2554d7fe93d4ec4487de01168fa2547b42276572253a087"),
+        ("0002-wmma-gfx12-asm.patch", "b99660f9cf54e0c1c654544e993a8d76b47db3aa182b87581b9090cf3be13aee"),
     ),
     "experimental": (
-        ("experimental-full.patch", "6daa526d22f3cef2c2ccd91b24bf30e0991aaf309e9381270ebe174c2f9a2e3d"),
+        ("experimental-full.patch", "2ab51be29663bc92767488b6dc2114f82d4dbef9cacf8aa3c157a9768c4b20ef"),
     ),
 }
-Q = "exllamav3/exllamav3_ext/rocm/quant/"
 FILES = {
     Q + "exl3_gemm_rdna.hip": "0d42d33f7f67ccad350224f310c4a762c6db983e417f29530760a54b85fa1a70",
     Q + "exl3_gemv_int8_rdna.hip": "b17c6884d7257ba6f1ab3ae686d7b5d0ebc35e1a6db888e3f3ef00d3df5be081",
     Q + "exl3_moe_rdna.hip": "af9fa4ff7ec8f2ce9e435b472559e68ab749658a146a4d6d0ba1693ac7fc2fdd",
+    Q + "exl3_gemm_inner_rdna.hip.h": "e64f5875168df31572836c945a15df6e7e4c7d48c1c619a563e142934de14ad1",
+    R + "rdna_wmma.hip.h": "c6cc075db7db550b074e293cabe22a84561031690bfa5d496e094b59c4cf8843",
     "exllamav3/rocm_py/__init__.py": "84bd5bf1c5f889033d4838a531e019959d109fcd126584711444cdfe3c63e52d",
 }
 EXPERIMENTAL = {

@@ -54,12 +54,11 @@ not make every upstream experimental environment switch safe.
 
 ## Troubleshooting
 
-- **gfx1201 hardware exception on the first chat request (known issue,
-  2026-09-24):** the fork's server generation path raises
-  `HSA_STATUS_ERROR_EXCEPTION` while direct-model generation is unaffected.
-  Reproduces with the frozen baseline binary (fork-level; local kernel work
-  exonerated). `EXL3_ROCM_FORCE_TORCH=1` does not rescue it. Untested bisect
-  handles: `EXL3_BC_ATTN=0` (attention family), a non-paged cache if exposed.
+- **gfx1201 hardware exception on the first chat request (RESOLVED
+  2026-09-24):** was the fork's WMMA-gfx11 GEMM trapping on gfx12 in the
+  server's prefill path; fixed by `patches/0002-wmma-gfx12-asm.patch` (now in
+  both profiles). Builds made before that patch still fault — re-prepare the
+  backend and rebuild the extension.
 - Build errors: confirm ROCm 7.2.4, the ROCm PyTorch wheel, Python 3.12, and a
   `gfx1201` target. Do not replace ROCm PyTorch with a CUDA wheel.
 - Out of memory: stop other GPU workloads; do not raise batch/chunk/cache sizes.

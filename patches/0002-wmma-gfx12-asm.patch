@@ -1,0 +1,80 @@
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_inner_rdna.hip.h b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_inner_rdna.hip.h
+index 6e1944a..1ba60b4 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_inner_rdna.hip.h
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_inner_rdna.hip.h
+@@ -499,7 +499,14 @@ void exl3_gemm_kernel_inner
+     // Column of the output tile owned by element j of fragment n.
+     auto out_col = [&] (int n, int j)
+     {
++#if defined(__gfx1200__) || defined(__gfx1201__)
++        // gfx12 dst layout (see rdna_wmma::mma_sync): consecutive columns --
++        // the lane's wave half selects the column half (j+8 for lanes 16..31),
++        // not the gfx11 j*2+c_col_base interleave.
++        return (warp_id * FRAGS_N_PER_WARP + n) * 16 + j + ((lane_id >= 16) ? 8 : 0);
++#else
+         return (warp_id * FRAGS_N_PER_WARP + n) * 16 + j * 2 + c_col_base;
++#endif
+     };
+ 
+     auto read_sum_gl = [&] ()
+diff --git a/exllamav3/exllamav3_ext/rocm/rdna_wmma.hip.h b/exllamav3/exllamav3_ext/rocm/rdna_wmma.hip.h
+index 156f449..81d20bd 100644
+--- a/exllamav3/exllamav3_ext/rocm/rdna_wmma.hip.h
++++ b/exllamav3/exllamav3_ext/rocm/rdna_wmma.hip.h
+@@ -268,19 +268,43 @@ __device__ __forceinline__ void mma_sync(
+     const WmmaFragB& b)
+ {
+ #if defined(__gfx1200__) || defined(__gfx1201__)
+-    // RDNA4: the gfx11 WMMA encodings do not exist -- LLVM fails instruction
+-    // selection on this intrinsic ("Cannot select: llvm.amdgcn.wmma.f32...").
+-    // The only live instantiations reaching this wrapper are the fused-MoE
+-    // comp units, and rocm_py steers MoE to the per-expert path on gfx120x,
+-    // so this body is unreachable at runtime there. Trap rather than emulate:
+-    // silent wrong numbers are the one unacceptable outcome, and a real gfx12
+-    // WMMA port (half-size fragments, no operand duplication across wave
+-    // halves) needs RDNA4 hardware to validate the layout -- not done yet.
+-    // Other wrappers in this header keep the bare gfx11 builtin on purpose:
+-    // if a future instantiation drags them into a gfx12 build, a LOUD compile
+-    // failure is the correct behavior.
+-    (void) a; (void) b; (void) c;
+-    __builtin_trap();
++    // gfx12 (RDNA4) WMMA port -- v_wmma_f16_16x16x16_f16 inline asm. The gfx11
++    // encodings do not exist on gfx12 ("Cannot select: llvm.amdgcn.wmma.f32...")
++    // and fp32-accumulator WMMA is not encoded on gfx120x at all: the only
++    // instruction is f16 inputs + f16 accumulator with 4-register (8 x f16)
++    // fragments. Fragment occupancy measured on gfx1201 (differential GEMM vs
++    // reference, per the gfx1201 bring-up report): src A: lane l<16 holds
++    // A[row][0..7], l>=16 holds A[row][8..15]; src B: K=16 split 8/8 across
++    // lanes l and l+16; dst: row = l%16, col = slot + (l>=16 ? 8 : 0)
++    // (consecutive columns -- the C mapping lives in exl3_gemm_inner_rdna.hip.h,
++    // out_col). The gfx11 A/B loaders are unchanged: this wrapper repurposes
++    // their 16-half fragments into the gfx12 8-half operands. Accumulation is
++    // f16 (the only accumulator hardware provides); values above 65504
++    // overflow. Operand order mirrors the builtin call below, (B, A, C).
++    int lane = threadIdx.x & 31;
++    int aoff = (lane >= 16) ? 8 : 0;
++    int32x4_t va, vb, vc;
++    const _Float16* ap = (const _Float16*) &a.data;
++    const _Float16* bp = (const _Float16*) &b.data;
++    _Float16* cp = (_Float16*) &vc;
++    #pragma unroll
++    for (int i = 0; i < 8; i++)
++    {
++        ((_Float16*) &va)[i] = ap[aoff + i];
++        ((_Float16*) &vb)[i] = bp[aoff + i];
++        cp[i] = (_Float16) 0.0f;
++    }
++    asm volatile("v_wmma_f16_16x16x16_f16 %0, %1, %2, 0"
++                 : "+v"(vc)
++                 : "v"(vb), "v"(va));
++    // MEASURED (experiments/0011-wmma-gfx12/wmma_acc_probe.hip): the gfx12
++    // f16 WMMA REPLACES its destination -- no imm value selects accumulation,
++    // unlike the gfx11 builtin's "C += A x B". Rebuild fp32 accumulation on
++    // top (one of the two options in the gfx1201 bring-up report): each k-tile
++    // product rounds through f16, the running sum stays fp32.
++    #pragma unroll
++    for (int i = 0; i < 8; i++)
++        ((float*) &c.data)[i] += (float) cp[i];
+ #else
+     c.data = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b.data, a.data, c.data);
+ #endif
