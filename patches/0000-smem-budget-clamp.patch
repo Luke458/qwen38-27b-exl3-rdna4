@@ -1,0 +1,68 @@
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_rdna.hip b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_rdna.hip
+index a1c8d13..1bacf16 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_rdna.hip
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemm_rdna.hip
+@@ -17,7 +17,13 @@
+ // the autotune-hash clamp; all merged clean.
+ //
+ // EXL3_RDNA_SMEM covers the four launch-configuration sites. The four autotuner
+-// sites still pass upstream's SMEM_MAX, unchanged from before this rebase.
++// sites now pass exl3_rdna_smem_budget(device) rather than upstream's SMEM_MAX:
++// SMEM_MAX (92160 with the gfx1201 setup.py table) makes
++// cudaFuncSetAttribute fail with "invalid argument" on parts whose real limit
++// is 64 KB (measured on the RX 9070 XT: sharedMemPerBlockOptin == 65536), which
++// surfaced as "GPU assert: invalid argument coop_autotune.cu 317" at the first
++// GEMM autotune. Candidates are already filtered by exl3_gemm_shape_compat()
++// against the same budget, so the budget is a safe common upper bound.
+ //
+ // A sibling is required because exl3_gemm.cu includes exl3_gemm_kernel.cuh,
+ // which reaches ptx.cuh through exl3_gemm_inner.cuh by relative quoted include.
+@@ -353,7 +359,7 @@ int exl3_gemm_gr
+     {
+         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb);
+         CoopAutotuneLaunch tuned;
+-        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
++        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, exl3_rdna_smem_budget(device), stream, &tuned))
+         {
+             add_graph_args((void*) tuned.kernel);
+             cuda_check(cudaPeekAtLastError());
+@@ -404,7 +410,7 @@ int exl3_gemm_gr
+             }
+             TORCH_CHECK(!candidates.empty(), "exl3_gemm autotune: no compatible kernel shapes");
+ 
+-            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, SMEM_MAX, stream, (size_t) size_k * size_n);
++            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, exl3_rdna_smem_budget(device), stream, (size_t) size_k * size_n);
+             add_graph_args((void*) tuned.kernel);
+             cuda_check(cudaPeekAtLastError());
+             return tuned.tag;
+@@ -740,7 +746,7 @@ int exl3_mgemm_gr
+         if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
+ 
+         CoopAutotuneLaunch tuned;
+-        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
++        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, exl3_rdna_smem_budget(device), stream, &tuned))
+         {
+             add_graph_args((void*) tuned.kernel);
+             cuda_check(cudaPeekAtLastError());
+@@ -773,7 +779,7 @@ int exl3_mgemm_gr
+             }
+             TORCH_CHECK(!candidates.empty(), "exl3_mgemm autotune: no compatible kernel shapes");
+ 
+-            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, SMEM_MAX, stream, (size_t) size_k * size_n * bszm);
++            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, exl3_rdna_smem_budget(device), stream, (size_t) size_k * size_n * bszm);
+             add_graph_args((void*) tuned.kernel);
+ 
+             // DBGI10(size_m, size_k, size_n, K, bszm_in, bszm_out, tuned.tag, tuned.block_dim, tuned.num_sms, tuned.concurrency);
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_moe_rdna.hip b/exllamav3/exllamav3_ext/rocm/quant/exl3_moe_rdna.hip
+index 3a4f9ed..7f54ebd 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_moe_rdna.hip
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_moe_rdna.hip
+@@ -388,7 +388,7 @@ void exl3_moe
+         grid_dim,
+         block_dim,
+         kernelArgs,
+-        SMEM_MAX,
++        MIN((size_t) SMEM_MAX, exl3_rdna_smem_budget(-1)),
+         stream
+     );
+ 

@@ -1,0 +1,41 @@
+# Local ROCm checkout and Python environment; recreated by the quickstart.
+/vendor/
+/.venv/
+/.locks/
+/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+*.so
+*.o
+
+# Model weights, numerical traces, binaries and campaign history remain local.
+/artifacts/
+/experiments/
+/models/
+*.safetensors
+*.npz
+*.log
+*.jsonl.tmp
+
+# Machine-specific measured inputs and historical working notes.
+/configs/acceptance_policy.json
+/configs/acceptance_policy.frozen.json
+/configs/acceptance_policy.frozen.json.sha256
+/configs/shape_manifest.json
+/configs/measured_gates.json
+/progress.json
+/REPORT.md
+/OPEN-ISSUES.md
+/ASSESSMENT-gfx1201-plan.md
+/IMPLEMENTATION_PLAN.md
+/OPTIMIZATION_LOOP.md
+
+# Do not publish credentials accidentally.
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secret*

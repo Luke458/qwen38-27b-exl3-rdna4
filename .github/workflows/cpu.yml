@@ -1,0 +1,16 @@
+name: CPU contracts
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy pytest
+      - run: >-
+          python -m pytest -q
+          tests/test_oracle.py tests/test_arithmetic_bounds.py
+          tests/test_runner_failures.py tests/test_model_gates.py
+          tests/test_serve.py

@@ -1,0 +1,129 @@
+{
+  "policy_id": "exl3-gfx1201-v1",
+  "status": "DRAFT",
+  "note": "Status becomes FROZEN via tools/freeze_policy.py which requires every null field to be filled from baseline-vs-oracle measurements (P1) and writes acceptance_policy.frozen.json + SHA256. Unset tolerances block promotion. Never loosen after a failure.",
+  "identities": {
+    "model": "GestaltLabs/Qwen3.8-27B-EXL3-11.5GB @ 0e6c4a863b945dbaf9657343fedd876c45e64dd5",
+    "model_local": "~/models/qwen3.8-27b-exl3-11.5gb",
+    "source": "CarouselAether/rocm_exl3 @ 311ff5497237a37bea18cf24aa18bc0c573d1d03",
+    "target_dispatch": "gfx1201, bits==3, codebook==mul1 (cb 2), fp16 in/out, M==1",
+    "gpu": "AMD Radeon RX 9070 XT (gfx1201, wave32, 32 CU)"
+  },
+  "scope_gates": {
+    "eligible_predicate": "arch==gfx1201 AND bits==3 AND codebook==mul1 AND dtype==fp16 AND size_m==1 AND size_k%128==0 AND size_n%128==0 AND suh+A_had+svh present",
+    "fallback_contract": "unsupported calls must decline without modifying outputs and run the pinned-fork fp16 path unchanged",
+    "int8_arithmetic_not_bitwise": "the int8 activation path is a separate numerical change with its own budget; it is never claimed bitwise-equivalent to fp16"
+  },
+  "exactness": {
+    "applies_to": ["trellis state windows", "transition bits", "packed tile bitfields", "mul1 codebook decode values (fp16)", "dispatch decisions"],
+    "rule": "bit-exact equality against reference/exl3_oracle.py and, for regression parity, against the pinned fork's ext.reconstruct / ext.decode",
+    "tolerance": 0.0
+  },
+  "float_gates_same_arithmetic": {
+    "comment": "P3 candidate (same arithmetic as baseline) vs FP32 oracle. Metrics are scale-aware (normalizing by output RMS) because output magnitude varies ~100x across shapes. Bounds below are analytic/accumulation-order ceilings from fp16-boundary staging + fp32 accumulation; the measured baseline deviations (null now) set the actual gate = max(analytic, 4x measured_baseline_worst).",
+    "metrics": ["normalized_max_abs_err", "normalized_rms_err", "cosine_similarity", "abs_rel_bound_ratio"],
+    "abs_rel_definition": "|diff| <= 4e-3 * RMS(ref) + 2e-3 * |ref| per element; abs_rel_bound_ratio is max |diff| / bound, must be <= 1.0",
+    "analytic_bounds": {
+      "normalized_max_abs_err": 0.003,
+      "normalized_rms_err": 0.0002,
+      "cosine_similarity_min": 0.999999,
+      "abs_rel_bound_ratio": 1.0
+    },
+    "measured_baseline": {
+      "normalized_max_abs_err": null,
+      "normalized_rms_err": null,
+      "cosine_similarity_min": null,
+      "abs_rel_bound_ratio": null,
+      "measured_at": null
+    },
+    "final_gate_rule": "gate(metric) = max(analytic_bound(metric), 4 * measured_baseline(metric)) computed at freeze; recorded in the frozen file"
+  },
+  "float_gates_int8_plain": {
+    "comment": "P4 plain int8 mode: activation quantization is an intended numerical change. Budget frozen before optimization; upstream reports ~0.9% output RMS deviation; CPU oracle measures ~0.55% on random fixtures. Budget set from baseline-vs-oracle on REAL tensors before any candidate runs.",
+    "metrics": ["normalized_max_abs_err", "normalized_rms_err", "cosine_similarity"],
+    "budget": {
+      "normalized_rms_err": null,
+      "normalized_max_abs_err": null,
+      "cosine_similarity_min": null
+    }
+  },
+  "float_gates_int8_residual": {
+    "comment": "P4 residual mode (~15-16 bit effective activation precision). CPU oracle measures ~0.03% NRMS on random fixtures.",
+    "budget": {
+      "normalized_rms_err": null,
+      "max_abs_err": null,
+      "cosine_similarity_min": null
+    }
+  },
+  "model_level_gates": {
+    "comment": "Frozen before any candidate evaluation. Teacher-forced logits on identical histories are the gate; greedy text equality is diagnostic only.",
+    "teacher_forced": {
+      "prompts": "fixtures/prompts_calibration.jsonl (calibration) and fixtures/prompts_holdout.jsonl (final holdout, never used for tuning)",
+      "metric": "logit max-abs-diff and KL vs pinned-baseline teacher-forced logits",
+      "budget_logit_max_abs": null,
+      "budget_kl_mean": null
+    },
+    "held_out_loss": {
+      "budget_delta_ppl": null
+    },
+    "generation_stability": {
+      "rule": "greedy decode on holdout prompts must stay coherent; token equality is diagnostic, not the gate",
+      "min_token_agreement_rate": null
+    }
+  },
+  "performance_gates": {
+    "comment": "Frozen at P2 per IMPLEMENTATION_PLAN.md. Paired trials: 10 decision pairs + 5 reserved confirmation pairs for the selected winner only.",
+    "primary_workload": "1024_prompt_256_decode",
+    "holdout_workloads": ["128_prompt_256_decode", "4096_prompt_256_decode"],
+    "paired_trials_decision": 10,
+    "paired_trials_confirmation": 5,
+    "order": "alternate baseline/candidate ordering across pairs after warmup",
+    "gates": {
+      "decode_speedup_ci95_lower_gt": 1.0,
+      "decode_speedup_median_ge": 1.05,
+      "holdout_max_regression": 0.03,
+      "regression_uncertainty": "more measurement, never promotion",
+      "memory_within_fit_budget": true,
+      "no_gpu_faults_or_hangs": true
+    },
+    "secondary_reporting": ["prefill_time", "ttft", "tpot", "tokens_per_s", "peak_vram"],
+    "reporting_rules": [
+      "weighted layer time using actual dispatch frequencies; never an unweighted average of per-shape speedups as a tokens/s claim",
+      "kernel speedup and model speedup reported separately",
+      "unprofiled performance measured; traces collected in separate runs"
+    ],
+    "invalidation_rules": [
+      "a trial is invalid only for a predeclared environmental condition: competing GPU process visible in rocm-smi, GPU edge temp > 90C, thermal throttle flag, or clock override detected",
+      "invalid samples are retained with reasons, never discarded"
+    ]
+  },
+  "memory_fit_budget_bytes": 16106127360,
+  "memory_fit_budget_derivation": "15 GiB cap on 16.3 GiB RX 9070 XT, reserving at least 1.3 GiB desktop headroom; validate baseline fit and actual available VRAM at P0 before freeze",
+  "numerics_safety": {
+    "int_accumulation": {
+      "rule": "prove int32 accumulation cannot overflow for supported K_in",
+      "bound": "per dp4a term |i| <= 127 and byte_sum <= 1020 -> |term| <= 129540; K_in=17408 with per-slice partials <= 512 rows*16 terms per accumulator -> worst partial < 2^31 / 16; full-sum recombination in float32",
+      "required_test": "tests/test_arithmetic_bounds.py"
+    },
+    "fixtures": [
+      "trellis boundaries", "packing alignment", "state transitions", "sign handling",
+      "transform normalization", "scale extremes", "zero input", "impulses",
+      "alternating signs", "fixed random seeds", "activation outliers", "supported tails",
+      "repeated calls", "different streams", "graph replay", "rejected layouts/shapes/dtypes -> fallback correct"
+    ]
+  },
+  "budgets": {
+    "max_built_candidates": 24,
+    "max_gpu_hours": 4,
+    "budget_starts": "after P2 (baseline + harness) completes",
+    "inconclusive_retries_per_candidate": 2,
+    "stall_rule": "six consecutive correct candidates without material gain ends that hypothesis family",
+    "stop_conditions": [
+      "kernel reaches >= 90% of the measured sustainable streaming roofline (bench_layer efficiency) -- stop GEMV micro-tuning and move up to fusion",
+      "another component dominates end-to-end decode time",
+      "three substantial optimization attempts each yield < 1% improvement",
+      "further complexity carries unacceptable correctness/maintenance cost"
+    ],
+    "fault_rule": "GPU fault / reset / device loss / repeated hang stops GPU execution immediately; preserve logs; require healthy-device preflight before resuming; never reset GPU, kill unrelated processes, change clocks or drivers"
+  }
+}

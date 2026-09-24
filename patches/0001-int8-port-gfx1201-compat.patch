@@ -1,0 +1,567 @@
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_int8_rdna.hip b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_int8_rdna.hip
+index df3451e..defbb6f 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_int8_rdna.hip
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_int8_rdna.hip
+@@ -1,67 +1,363 @@
+ // =============================================================================
+-// exl3_gemv_int8 for RDNA -- NOT PORTED, path disabled
++// exl3_gemv_int8 for RDNA -- staged ordinary-launch port, bits=3 / mul1 / M=1
+ // =============================================================================
+ //
+-// This file exists so the ROCm build links. It is not a port: it defines
+-// upstream v1.3.0's quant/exl3_gemv_int8.cu interface with the path
+-// unconditionally off, so every caller falls through to the fp16 kernels.
++// Replaces the disabled stub. Implements the upstream interface with the v1
++// scope of this project (IMPLEMENTATION_PLAN.md):
+ //
+-// Upstream's quant/exl3_gemv_int8.cu cannot be built with the shim. It carries
+-// inline PTX (a dp4a.u32.s32 in quant/exl3_gemv_int8_kernel.cuh, one of the
+-// three PTX-bearing files in the tree) and cp_async at three sites. Probed
+-// directly it fails with "invalid output constraint '=f' in asm".
++//   eligible:  gfx1201, bits == 3, cb == mul1, M == 1, fp16 in/out,
++//              size_k % 128 == 0, size_n % 128 == 0, suh + A_had + svh present
++//   declines everything else (-> regular fp16 kernels), and a declined call
++//   never modifies outputs.
+ //
+-// There is no fork equivalent to carry forward -- the fused int8-activation GEMV
+-// is new in v1.3.0, so this is the one piece of the quant path that has to be
+-// written rather than ported. What it needs, in rough order:
++// Architecture (four ordinary launches -- no cooperative grid, no grid.sync):
+ //
+-//   - dp4a.u32.s32 -> sudot4(false, a, true, b, c, false). NOT sdot4: gfx1151
+-//     lacks dot1-insts, so sdot4 fails to compile and reads like "no int8
+-//     support". It has dot8-insts. Watch the sign-flag pairing -- each flag
+-//     describes the vector that follows it.
+-//   - Alternatively the native i32_16x16x16_iu8 WMMA, whose wrapper
+-//     (mma_sync_i8<signed_a, signed_b> in rocm/rdna_wmma.hip.h) is implemented
+-//     and validated by rocm_tools/wmma_check.hip. That hides the sign-flag trap.
+-//   - 3 cp_async sites.
+-//   - The cooperative launch structure, which is the same shape as the GEMM's
+-//     and so subject to the same LDS sizing issue -- see EXL3_RDNA_SMEM in
+-//     exl3_gemm_rdna.hip.
++//   1. had:     input Hadamard (suh pre-scale, 128-pt, 1/sqrt(128)) into the
++//               fp16 A_had scratch.
++//   2. quant:   global max -> q = max/127, int8 splat-free activation vector
++//               + exact int sum s1. A separate launch is required: a block
++//               barrier cannot publish all Hadamard output across the grid.
++//   3. dot:     packed trellis reads, exact mul1 state reconstruction
++//               (16-bit sliding windows), integer dot accumulation. One block
++//               per 16-wide N-tile; WARPS warps split the K range and reduce
++//               through 16 int32 of LDS per warp. dp4a(x, splat(i)) evaluates
++//               codebook(w) * a with exact int32 accumulation because the mul1
++//               codebook value is affine in byte_sum(w * 0x83DCD12D).
++//   4. output:  affine correction + output Hadamard + svh + fp16 store:
++//               y[n] = k_inv * q * acc[n] + (1024*k_inv + k_bias) * q * s1
++//                      then Had128 and svh post-scale.
+ //
+-// Behaviour of the stubs below is the correct disabled semantics, not an
+-// approximation:
++// Accumulator overflow: each int32 accumulator holds one warp's K-slice
++// (<= K_in/WARPS + 1 terms, |term| <= 127*1020 = 129540). Warp partials
++// are converted to float before their final sum: full-K signed int32 can
++// overflow at K_in=17408. See tests/test_arithmetic_bounds.py.
+ //
+-//   exl3_gemv_int8_enabled() -> false
+-//       exl3_gemm checks this before calling exl3_gemv_int8 at all, so the mul1
+-//       fast path is skipped and mul1 tensors run the regular kernel.
++// Modes (EXL3_ROCM_GFX1201_INT8):  0 off (fp16 fallback), 1 = int8 + residual
++// (declined in this build: falls back, tracked as future work), 2 = plain int8
++// (this implementation). EXL3_ROCM_GFX1201_INT8_TRACE=1 logs dispatch counts
++// and fallback reasons once per (K_in, N) at first use.
+ //
+-//   exl3_gemv_int8() -> false
+-//       "not handled, fall through to the regular kernel". Also correct on its
+-//       own if some future caller skips the enabled() check.
+-//
+-//   exl3_gemv_int8_max_k() -> 0
+-//       This one is bound to Python and read by Config.use_mgemm, which computes
+-//       K_thr = max_k + 1 and fuses when K >= K_thr. Returning 0 gives K_thr = 1,
+-//       so every K fuses -- which is what should happen when there is no int8
+-//       GEMV to unfuse *into*. Returning upstream's per-arch value here would
+-//       make the Python side unfuse MGEMM calls in favour of a path that does
+-//       not exist.
+-//
+-// When the real port lands, this file is replaced, not amended.
++// The switch is opt-in default OFF until P6 qualification (plan: "Initially
++// default off. Log dispatch counts and reasons for fallback in diagnostic
++// mode.").
+ // =============================================================================
+ 
+ #include <cuda_fp16.h>
+ #include "../../quant/exl3_gemv_int8.cuh"
+ 
++#include <ATen/ATen.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <ATen/cuda/CUDAContext.h>
++#include "../../util.h"
++#include "../../util.cuh"
++#include "../../quant/hadamard_inner.cuh"
++#include "exl3_kernel_map_rdna.hip.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <mutex>
++
++#define G1201_THREADS 256
++
++// ---------------------------------------------------------------------------
++// Dispatch policy + diagnostics
++// ---------------------------------------------------------------------------
++static int g1201_mode()
++{
++    const char* e = std::getenv("EXL3_ROCM_GFX1201_INT8");
++    return e ? atoi(e) : 0;   // opt-in, default off (plan: initially default off)
++}
++
++static bool g1201_trace()
++{
++    const char* e = std::getenv("EXL3_ROCM_GFX1201_INT8_TRACE");
++    return e && atoi(e) != 0;
++}
++
++static void g1201_trace_line(const char* what, int k, int n)
++{
++    if (!g1201_trace()) return;
++    static std::mutex mtx;
++    static std::map<std::pair<int, int>, int> seen;
++    std::lock_guard<std::mutex> lock(mtx);
++    auto key = std::make_pair(k, n);
++    if (seen[key]++ == 0)
++        std::printf("[exl3_gemv_int8_rdna] %s k=%d n=%d\n", what, k, n);
++}
++
+ bool exl3_gemv_int8_enabled()
+ {
+-    return false;
++    // Residual mode (1) and unknown values must not advertise an int8 path.
++    return g1201_mode() == 2;
+ }
+ 
+ int exl3_gemv_int8_max_k(int device)
+ {
+-    return 0;
++    if (!exl3_gemv_int8_enabled()) return 0;
++    const auto* props = at::cuda::getDeviceProperties(device);
++    return std::strncmp(props->gcnArchName, "gfx1201", 7) == 0 ? 3 : 0;
++}
++
++// ---------------------------------------------------------------------------
++// Kernel 1: input Hadamard
++// ---------------------------------------------------------------------------
++static __global__
++__launch_bounds__(G1201_THREADS)
++void g1201_had_kernel
++(
++    const half* __restrict__ A,        // [1, size_k]
++    half* __restrict__ A_had,          // [1, size_k] fp16 scratch
++    const half* __restrict__ suh,      // [size_k]
++    int size_k
++)
++{
++    int warps = size_k / 128;
++    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
++    if (warp_id < warps)
++    {
++        had_hf_r_128_inner<true, false>
++        (
++            A + warp_id * 128,
++            A_had + warp_id * 128,
++            suh + warp_id * 128,
++            0.088388347648f
++        );
++    }
+ }
+ 
++// Kernel 2: one block quantizes the complete Hadamard row after kernel 1
++// finishes on the same stream. This is the global synchronization boundary.
++static __global__
++__launch_bounds__(G1201_THREADS)
++void g1201_quant_kernel
++(
++    const half* __restrict__ A_had,
++    int8_t* __restrict__ A_q,
++    float* __restrict__ out_q,         // {q, s1} (s1 as int via reinterp)
++    int size_k
++)
++{
++    __shared__ float sh_m[33];
++
++    // Global max over the transformed row (fmax is order-independent).
++    float mx = 0.0f;
++    for (int i = threadIdx.x; i < size_k; i += G1201_THREADS)
++        mx = fmaxf(mx, fabsf(__half2float(A_had[i])));
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
++    if ((threadIdx.x & 31) == 0) sh_m[threadIdx.x >> 5] = mx;
++    __syncthreads();
++    if (threadIdx.x < 32)
++    {
++        float v = threadIdx.x < (G1201_THREADS >> 5) ? sh_m[threadIdx.x] : 0.0f;
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
++        if (threadIdx.x == 0) sh_m[32] = fmaxf(v, 1e-8f) / 127.0f;
++    }
++    __syncthreads();
++    float q = sh_m[32];
++
++    // Quantize to int8 splats-free vector + exact int sum (blueprint math).
++    float rq = 1.0f / q;
++    int s1 = 0;
++    for (int i = threadIdx.x; i < size_k; i += G1201_THREADS)
++    {
++        float a = __half2float(A_had[i]);
++        int v = __float2int_rn(a * rq);
++        v = max(-127, min(127, v));
++        A_q[i] = (int8_t) v;
++        s1 += v;
++    }
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) s1 += __shfl_xor_sync(0xffffffff, s1, o);
++    if ((threadIdx.x & 31) == 0) sh_m[threadIdx.x >> 5] = __int_as_float(s1);
++    __syncthreads();
++    if (threadIdx.x < 32)
++    {
++        int v = threadIdx.x < (G1201_THREADS >> 5) ? __float_as_int(sh_m[threadIdx.x]) : 0;
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
++        if (threadIdx.x == 0)
++        {
++            out_q[0] = q;
++            ((int*) out_q)[1] = v;
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Kernel 3: integer dot (bits=3, mul1) -- one block per 16-wide N-tile
++// ---------------------------------------------------------------------------
++__device__ __forceinline__ int g1201_dp4a(uint32_t a, uint32_t b, int c)
++{
++    // CUDA's dp4a.u32.s32 (a: unsigned bytes, b: signed bytes) -- the pairing
++    // the blueprint needs: w*M bytes unsigned, activation splat signed. Per
++    // hip_compat.hip.h: "quant/exl3_gemv_int8_kernel.cuh's dp4a.u32.s32 is
++    // exactly sudot4(false, a, true, b, c, false)". PTX inline asm does not
++    // exist on this backend (invalid instruction at device link).
++    return __builtin_amdgcn_sudot4(false, (int) a, true, (int) b, c, false);
++}
++
++template <int WARPS>
++static __global__
++__launch_bounds__(WARPS * 32)
++__attribute__((amdgpu_flat_work_group_size(WARPS * 32, WARPS * 32)))
++void g1201_dot_kernel
++(
++    const int8_t* __restrict__ A_q,
++    const uint16_t* __restrict__ B,    // trellis (K/16, N/16, 48)
++    float* __restrict__ accs,          // [size_n] fp32 warp-partial sum
++    int size_k,
++    int size_n
++)
++{
++    // One block per N-tile; the block's WARPS warps split K. Each warp owns a
++    // contiguous k16 range, accumulates 16 column partials in int32 (two
++    // columns per lane, quad-reduced), and reduces through LDS.
++    int warp_id = threadIdx.x / 32;
++    int lane = threadIdx.x % 32;
++    int tile_n = blockIdx.x;
++    int n_tiles = size_n / 16;
++    (void) n_tiles;
++
++    constexpr int bits = 3;
++    constexpr int tile_elements = 16 * bits;      // u16 per 16x16 tile
++    int num_k_tiles = size_k / 16;
++    int chunk = (num_k_tiles + WARPS - 1) / WARPS;
++    int kb0 = warp_id * chunk;
++    int kb1 = min(kb0 + chunk, num_k_tiles);
++
++    // lane mapping identical to exl3_gemv_dot_tile_direct (source-derived):
++    // lane L handles t = 8L..8L+7 -> (row, col) via t_to_rowcol
++    int r0 = (lane & 3) * 2;
++    int cA = 2 * (lane >> 3) + ((lane >> 2) & 1);
++
++    int accA = 0, accB = 0;
++    for (int k_tile = kb0; k_tile < kb1; ++k_tile)
++    {
++        const uint32_t* b_ptr = (const uint32_t*)
++            (B + ((size_t) k_tile * n_tiles + tile_n) * tile_elements);
++
++        // 8 state windows for this lane's t-range (bits=3 specialized ext8w)
++        int b1 = ((lane << 3) + 257) * bits;
++        int b0 = b1 - 16;
++        int i0 = (b0 / 32) % (bits * 8);
++        int i2 = ((b1 + bits * 7 - 1) / 32) % (bits * 8);
++        int s2 = ((b1 + bits * 7 - 1) / 32 + 1) * 32 - (b1 + bits * 7);
++        uint32_t a0 = b_ptr[i0];
++        uint32_t b0w = b_ptr[i2];
++        auto fsh = [&](int s) { return (uint32_t)(((uint64_t) a0 << 32 | b0w) >> s); };
++        uint32_t w7 = fsh(s2);
++        uint32_t w6 = w7 >> bits;
++        uint32_t w5 = w6 >> bits;
++        uint32_t w4 = w5 >> bits;
++        uint32_t w3 = fsh(s2 + bits * 4);
++        uint32_t w2 = w3 >> bits;
++        uint32_t w1 = w2 >> bits;
++        uint32_t w0 = w1 >> bits;
++        w0 &= 0xffff; w1 &= 0xffff; w2 &= 0xffff; w3 &= 0xffff;
++        w4 &= 0xffff; w5 &= 0xffff; w6 &= 0xffff; w7 &= 0xffff;
++
++        // exact mul1 state reconstruction: x = w * 0x83DCD12D (wrapping)
++        w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
++        w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
++
++        // position -> (row, col): i = 0..7 => row r0 + (i&1) + 8*((i>>1)&1),
++        // col cA + 8*(i>>2); dp4a(x, splat(i8[k])) adds i8[k] * byte_sum(x).
++        int k_base = k_tile * 16;
++        uint32_t s00 = 0x01010101u * (uint32_t)(uint8_t) A_q[k_base + r0];
++        uint32_t s01 = 0x01010101u * (uint32_t)(uint8_t) A_q[k_base + r0 + 1];
++        uint32_t s08 = 0x01010101u * (uint32_t)(uint8_t) A_q[k_base + r0 + 8];
++        uint32_t s09 = 0x01010101u * (uint32_t)(uint8_t) A_q[k_base + r0 + 9];
++
++        // NOTE on sign: A_q carries the activation sign; codebook(x) is affine
++        // in the unsigned byte sum, and dp4a.u32.s32 multiplies SIGNED bytes of
++        // the splat against UNSIGNED... -- dp4a interprets BOTH operands as
++        // signed bytes. byte_sum(w*M) is in [0, 1020] with arbitrary byte
++        // distribution; the signed-unsigned pairing is handled exactly as the
++        // upstream blueprint does (same dp4a form, same operands). Product
++        // bound for overflow remains |127| * 1020 per term.
++        accA = g1201_dp4a(w0, s00, accA);
++        accA = g1201_dp4a(w1, s01, accA);
++        accA = g1201_dp4a(w2, s08, accA);
++        accA = g1201_dp4a(w3, s09, accA);
++        accB = g1201_dp4a(w4, s00, accB);
++        accB = g1201_dp4a(w5, s01, accB);
++        accB = g1201_dp4a(w6, s08, accB);
++        accB = g1201_dp4a(w7, s09, accB);
++    }
++
++    // quad reduction: after xor hops 1,2 every lane of quad q holds the full
++    // sums for column cA = q (accA) and column q + 8 (accB)
++    accA += __shfl_xor_sync(0xffffffff, accA, 1);
++    accA += __shfl_xor_sync(0xffffffff, accA, 2);
++    accB += __shfl_xor_sync(0xffffffff, accB, 1);
++    accB += __shfl_xor_sync(0xffffffff, accB, 2);
++
++    __shared__ int sh_red[WARPS * 32];   // per warp: [8 x accA cols][8 x accB cols]
++    int* my_red = sh_red + warp_id * 32;
++    if ((lane & 3) == 0)
++    {
++        int q = lane >> 2;               // quad index == cA column
++        my_red[q] = accA;
++        my_red[16 + q] = accB;
++    }
++    __syncthreads();
++    if (warp_id == 0 && lane < 16)
++    {
++        float total = 0.0f;
++        #pragma unroll
++        for (int w = 0; w < WARPS; ++w)
++            total += (float) ((lane < 8) ? sh_red[w * 32 + lane] : sh_red[w * 32 + 16 + (lane - 8)]);
++        accs[tile_n * 16 + lane] = total;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Kernel 4: affine correction + output Hadamard + svh + fp16 store
++// ---------------------------------------------------------------------------
++static __global__
++__launch_bounds__(G1201_THREADS)
++void g1201_out_kernel
++(
++    const float* __restrict__ accs,
++    half* __restrict__ C,              // [size_n]
++    const float* __restrict__ qrow,    // {q, s1}
++    const half* __restrict__ svh,
++    int size_n
++)
++{
++    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
++    int lane = threadIdx.x % 32;
++    int warps = size_n / 128;
++    if (warp_id >= warps) return;
++
++    float k_inv = __half2float(__ushort_as_half(0x1eee));
++    float k_bias = __half2float(__ushort_as_half(0xc931));
++    float q = qrow[0];
++    float s1 = (float) ((const int*) qrow)[1];
++    float corr = (1024.0f * k_inv + k_bias) * (q * s1);
++
++    // per-warp 128 floats of LDS (8 warps/block max): 4 KB per block
++    extern __shared__ float sh_tmp[];
++    float* tmp = sh_tmp + (threadIdx.x / 32) * 128;
++
++    int base = warp_id * 128;
++    #pragma unroll
++    for (int i = 0; i < 4; ++i)
++    {
++        int j = lane * 4 + i;
++        tmp[j] = k_inv * (q * accs[base + j]) + corr;
++    }
++    __syncwarp();
++    had_fh_r_128_inner<false, true>(tmp, C + base, svh + base, 0.088388347648f);
++}
++
++// ---------------------------------------------------------------------------
++// Host entry
++// ---------------------------------------------------------------------------
+ bool exl3_gemv_int8
+ (
+     const at::Tensor& A,
+@@ -74,5 +370,111 @@ bool exl3_gemv_int8
+     Graph* graph
+ )
+ {
+-    return false;
++    int mode = g1201_mode();
++    if (mode != 2) { g1201_trace_line("fallback: disabled or unsupported mode", 0, 0); return false; }
++    if (graph)   { g1201_trace_line("fallback: graph capture (staged path not graph-wrapped yet)", 0, 0); return false; }
++    if (!suh.has_value() || !A_had.has_value() || !svh.has_value())
++    {
++        g1201_trace_line("fallback: missing transforms", 0, 0);
++        return false;
++    }
++
++    if (!A.is_cuda() || A.dim() < 2 || B.dim() != 3 || A.size(-1) <= 0 ||
++        A.scalar_type() != at::kHalf || B.scalar_type() != at::kShort ||
++        C.scalar_type() != at::kHalf || !A.is_contiguous() ||
++        !B.is_contiguous() || !C.is_contiguous() ||
++        B.device() != A.device() || C.device() != A.device()) return false;
++    if (!exl3_gemv_int8_max_k(A.get_device())) return false;
++    for (const auto* t : {&suh.value(), &A_had.value(), &svh.value()})
++        if (t->device() != A.device() || t->scalar_type() != at::kHalf || !t->is_contiguous())
++            return false;
++    if (B.size(2) != 48) return false;
++    int K = B.size(2) / 16;               // bitrate (bits)
++    int size_k = A.size(-1);
++    int size_n = B.size(1) * 16;
++    int size_m = A.numel() / size_k;
++    if (K != 3) { g1201_trace_line("fallback: bits != 3", K, size_n); return false; }
++    if (size_m != 1) { g1201_trace_line("fallback: M != 1", K, size_n); return false; }
++    if (size_k % 128 || size_n % 128) { g1201_trace_line("fallback: shape alignment", K, size_n); return false; }
++    if (C.dtype() != at::kHalf) { g1201_trace_line("fallback: C not fp16", K, size_n); return false; }
++    if (size_k > 17408 || size_n <= 0 || B.size(0) * 16 != size_k ||
++        C.numel() != size_n || suh->numel() != size_k ||
++        A_had->numel() != size_k || svh->numel() != size_n) return false;
++
++    const at::cuda::OptionalCUDAGuard device_guard(A.device());
++    hipStreamCaptureStatus capture_status;
++    cuda_check(hipStreamIsCapturing(stream, &capture_status));
++    if (capture_status != hipStreamCaptureStatusNone) return false;
++    const c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream, A.get_device()));
++    cudaStream_t s = stream;
++
++    // workspace: per-call float accumulators ([size_n]) + {q, s1} floats.
++    // Allocated through Torch so graph capture of later work is unaffected.
++    // Per-call buffers on the guarded launch stream are safely recycled by
++    // Torch's caching allocator. A thread-local buffer races across streams.
++    auto ws_acc = at::empty({size_n}, A.options().dtype(at::kFloat));
++    auto ws_q = at::empty({4}, A.options().dtype(at::kFloat));
++    auto ws_aq = at::empty({size_k}, A.options().dtype(at::kChar));
++
++    // Launch 1: input Hadamard
++    {
++        int blocks = (size_k / 128 * 32 + G1201_THREADS - 1) / G1201_THREADS;
++        hipLaunchKernelGGL(
++            g1201_had_kernel,
++            dim3(blocks), dim3(G1201_THREADS), 0, s,
++            (const half*) A.data_ptr(),
++            (half*) A_had.value().data_ptr(),
++            (const half*) suh.value().data_ptr(),
++            size_k);
++    }
++
++    // Launch 2: globally synchronized quantization and exact activation sum
++    {
++        hipLaunchKernelGGL(
++            g1201_quant_kernel,
++            dim3(1), dim3(G1201_THREADS), 0, s,
++            (const half*) A_had.value().data_ptr(),
++            (int8_t*) ws_aq.data_ptr(),
++            (float*) ws_q.data_ptr(),
++            size_k);
++    }
++
++    // Launch 3: integer dot (split-K by warps per block)
++    int n_tiles = size_n / 16;
++    int k_blocks = size_k / 16;
++    int warps = 8;
++    if (const char* value = std::getenv("EXL3_ROCM_GFX1201_WARPS"))
++    {
++        int requested = atoi(value);
++        if (requested == 4 || requested == 8 || requested == 16) warps = requested;
++    }
++    {
++        #define G1201_DOT(W) \
++            hipLaunchKernelGGL((g1201_dot_kernel<W>), dim3(n_tiles), dim3((W) * 32), \
++                0, s, \
++                (const int8_t*) ws_aq.data_ptr(), (const uint16_t*) B.data_ptr(), \
++                (float*) ws_acc.data_ptr(), size_k, size_n)
++        if (warps == 4) { G1201_DOT(4); }
++        else if (warps == 16) { G1201_DOT(16); }
++        else { G1201_DOT(8); }
++        #undef G1201_DOT
++    }
++
++    // Launch 4: output transform (8 warps x 128 floats of staging per block)
++    {
++        int blocks = (size_n / 128 + 7) / 8;
++        hipLaunchKernelGGL(
++            g1201_out_kernel,
++            dim3(blocks), dim3(G1201_THREADS),
++            8 * 128 * sizeof(float), s,
++            (const float*) ws_acc.data_ptr(),
++            (half*) C.data_ptr(),
++            (const float*) ws_q.data_ptr(),
++            (const half*) svh.value().data_ptr(),
++            size_n);
++    }
++
++    cuda_check(cudaPeekAtLastError());
++    g1201_trace_line("int8 staged GEMV", K, size_n);
++    return true;
+ }
+diff --git a/exllamav3/rocm_py/__init__.py b/exllamav3/rocm_py/__init__.py
+index 3d4d2c9..f0a0b99 100644
+--- a/exllamav3/rocm_py/__init__.py
++++ b/exllamav3/rocm_py/__init__.py
+@@ -92,6 +92,39 @@ def apply() -> list[str]:
+ 
+     applied: list[str] = []
+ 
++    # gfx1201 dense multi-row GEMM reaches rdna_wmma::mma_sync, which
++    # deliberately traps on gfx12. Use the existing reconstruction path for
++    # multi-row LinearEXL3 calls until native gfx12 GEMM is qualified. Keep
++    # M=1 on the packed GEMV path. This also covers autosplit test forwards.
++    import torch as _torch
++    from ..modules.quant.exl3 import LinearEXL3 as _LinearEXL3
++    _original_linear_forward = _LinearEXL3.forward
++
++    def _gfx1201_linear_forward(self, x, params, out_dtype=None):
++        if (x.is_cuda and x.numel() // x.shape[-1] > 1
++                and _torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0] == "gfx1201"):
++            params = dict(params, reconstruct=True)
++        return _original_linear_forward(self, x, params, out_dtype)
++
++    _LinearEXL3.forward = _gfx1201_linear_forward
++    applied.append("gfx1201 multi-row EXL3 Linear -> reconstruct+hgemm (WMMA trap avoidance)")
++
++    # The extension's scalar maximum bitrate cannot describe a bits==3-only
++    # implementation. Keep other bitrates fused and preserve disabled mode.
++    from ..model.config import InferParams as _InferParams
++    _original_use_mgemm = _InferParams.use_mgemm
++
++    def _gfx1201_use_mgemm(self, K, out_features, mul1=False, device=None):
++        if device is not None:
++            dev = _torch.device(device)
++            if (dev.type == "cuda" and
++                    _torch.cuda.get_device_properties(dev).gcnArchName.split(":")[0] == "gfx1201"):
++                if os.environ.get("EXL3_ROCM_GFX1201_INT8", "0") != "2" or K != 3:
++                    return True
++        return _original_use_mgemm(self, K, out_features, mul1, device)
++
++    _InferParams.use_mgemm = _gfx1201_use_mgemm
++
+     # ------------------------------------------------------------------
+     # arch_list: hipcc takes PYTORCH_ROCM_ARCH, not TORCH_CUDA_ARCH_LIST
+     # ------------------------------------------------------------------

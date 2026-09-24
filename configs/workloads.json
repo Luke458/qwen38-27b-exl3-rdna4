@@ -1,0 +1,32 @@
+{
+  "comment": "Workload identities frozen at P2. Fixed tokenized prompts (fixtures) and generation length; batch/concurrency 1; speculation off; fixed tokenizer/checkpoint/cache dtype (fp16 cache). Early EOS must not shorten the work: generation runs a fixed 256 decode steps regardless of emitted tokens.",
+  "cache_dtype": "fp16",
+  "batch": 1,
+  "decode_tokens": 256,
+  "workloads": [
+    {"id": "128_prompt_256_decode", "prompt_tokens": 128, "decode_tokens": 256, "role": "holdout"},
+    {"id": "1024_prompt_256_decode", "prompt_tokens": 1024, "decode_tokens": 256, "role": "primary"},
+    {"id": "4096_prompt_256_decode", "prompt_tokens": 4096, "decode_tokens": 256, "role": "holdout"}
+  ],
+  "unsupported_context_policy": "skip with explicit report; never change the denominator",
+  "execution_modes": ["graph", "eager"],
+  "measurements": {
+    "prefill_s": "time to process the prompt chunk(s), GPU events on the executing stream",
+    "ttft_s": "first token latency including prefill",
+    "tpot_s": "steady decode time per token over the 256-token window (median)",
+    "tokens_per_s": "1.0 / mean steady TPOT (batch 1)",
+    "peak_vram_bytes": "hipMemGetInfo delta high-water mark during the run"
+  },
+  "microbench_shapes": {
+    "comment": "Layer shapes taken from configs/shape_manifest.json (actual checkpoint tensors). Representative = weighted by invocation count per decode step.",
+    "m": 1
+  },
+  "timing_method": {
+    "events": "hipEvent on the executing stream",
+    "warmup_iters": 25,
+    "batched_iters": 100,
+    "retain_raw": true,
+    "paired_trials": {"decision": 10, "confirmation": 5, "alternating_order": true},
+    "unprofiled_only_for_gates": true
+  }
+}

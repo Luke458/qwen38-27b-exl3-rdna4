@@ -1,0 +1,43 @@
+{
+  "description": "Compact end-to-end eager decode evidence for unroll-4 plus fused-Hadamard stack versus frozen baseline; 10 alternating paired trials, calibration prompt 0, batch 1, 256 decode tokens",
+  "units": {"decode": "seconds for 255 steady decode steps", "speedup": "baseline decode seconds / candidate decode seconds"},
+  "method": "median of per-pair speedups; percentile bootstrap of median with 10000 resamples, seed 20260923 (tools/compare.py::bootstrap_ci)",
+  "source_revision": {
+    "upstream_fork_commit": "311ff5497237a37bea18cf24aa18bc0c573d1d03",
+    "current_checkout_gemv_kernel_sha256": "c29b0eff29d64e9b02b0814780a9522f541de869e75920565776a7d321cd3909",
+    "candidate_binary_manifest": "experiments/0009b-unroll4/binary/manifest.json",
+    "note": "The source hash identifies the current checkout; the manifest records the measured candidate binary. This summary does not independently prove the build source from a source archive."
+  },
+  "input_sha256": {
+    "experiments/0009b-unroll4/paired_baseline.json": "58e4c4e8bc4b6b16d33b789023b826b72bab0e436034f1066ef61e45f89cd577",
+    "experiments/0009b-unroll4/paired_candidate_stack.json": "48ec540f5023527cf135f006cacb9bbb57812a44009d4379cd94a18b43f6492d",
+    "configs/acceptance_policy.frozen.json": "b03463445cc7412aa827c68d534eb2709803ea54d3b6ca1bcd520d55634cb894"
+  },
+  "invalid_samples": 0,
+  "workloads": {
+    "128_prompt_256_decode": {
+      "baseline_decode_median_s": 8.598921,
+      "candidate_decode_median_s": 8.248820,
+      "paired_speedup_median": 1.042176,
+      "paired_speedup_ci95": [1.040970, 1.043842],
+      "paired_speedups": [1.039953, 1.042644, 1.040322, 1.044041, 1.041904, 1.043842, 1.043855, 1.041091, 1.041617, 1.042448]
+    },
+    "1024_prompt_256_decode": {
+      "role": "primary",
+      "baseline_decode_median_s": 8.670091,
+      "candidate_decode_median_s": 8.321577,
+      "paired_speedup_median": 1.041602,
+      "paired_speedup_ci95": [1.039560, 1.042513],
+      "paired_speedups": [1.037649, 1.042992, 1.042035, 1.041545, 1.041472, 1.046884, 1.039560, 1.034646, 1.041658, 1.042505]
+    },
+    "4096_prompt_256_decode": {
+      "baseline_decode_median_s": 8.714286,
+      "candidate_decode_median_s": 8.361949,
+      "paired_speedup_median": 1.042037,
+      "paired_speedup_ci95": [1.040416, 1.042488],
+      "paired_speedups": [1.036454, 1.042275, 1.040858, 1.042488, 1.042537, 1.042311, 1.039974, 1.040554, 1.043111, 1.041798]
+    }
+  },
+  "frozen_primary_gate": {"minimum_median_speedup": 1.05, "minimum_ci95_lower_exclusive": 1.0, "decision": "NOT_QUALIFIED", "confirmation_pairs_run": 0},
+  "correctness_scope": "Unroll-2 has a recorded teacher-forced comparison; a separate model-correctness artifact for the combined unroll-4 plus fusion stack is not present in this snapshot."
+}

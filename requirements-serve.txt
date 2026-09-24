@@ -1,0 +1,6 @@
+# Serving API dependencies validated in the local Python 3.12 environment.
+# Install the pinned ROCm torch and fork requirements_rocm.txt first.
+fastapi==0.141.1
+uvicorn==0.53.0
+sse-starlette==3.4.11
+transformers==5.17.0
