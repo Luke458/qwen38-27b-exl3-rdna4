@@ -31,7 +31,9 @@ there is no separate `0009b` model-correctness artifact in this snapshot.
 The bundled fork includes an OpenAI-compatible server (`tools/serve.py`).
 Endpoint startup and `/health` pass, but on 2026-09-24 the first chat request
 **faulted the GPU on gfx1201** (`HSA_STATUS_ERROR_EXCEPTION`, reproduced 2/2 in
-both authentication modes) inside the fork's server generation path. Serving is
+both authentication modes, and again with the frozen baseline binary — so this
+is a fork-level defect and the local kernel work is exonerated) inside the
+fork's server generation path (paged-KV/GDN generator entries). Serving is
 therefore **not usable on this GPU** pending a fix; direct-model generation via
 `bench/` is unaffected by the same fault. Server behavior, public hosting
 readiness, and server throughput remain unverified. The documented
