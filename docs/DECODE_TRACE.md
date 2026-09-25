@@ -30,3 +30,19 @@ local `experiments/0015-kernel-trace`, `0016-vllm-base` and `0017-exl3-plugin` (
   in the server; host/scheduling side still open. GDN metadata was rebuilt per layer (24×/step,
   12.6 ms host). `vllm_plugin/patches/.../gdn_attn_share_build.patch` builds once (+2%, output identical).
 - EXL3 plugin, first light: 19.2 tok/s plain decode; 2,179 kernels/token, 33.4 ms GPU/token.
+
+## Current state (2026-09-25, vLLM + exl3rocm)
+
+| config | decode tok/s |
+|---|---:|
+| plain | 41.3 |
+| native MTP k=3 (bit-exact multi-row verify, V2 runner) | 73.9 (prose 73.7 / code 90.6 / story 60.4) |
+
+- GEMV core (fork patch 0001): the codebook hash uses full-rate `v_mul_u32_u24` pairs instead of the
+  quarter-rate `v_mul_lo_u32` (called through the `llvm.amdgcn.mul.u24` intrinsic, marked noconvergent,
+  with its operands read from a device global so LLVM cannot re-fuse them). Also: wave-uniform `warp_id`,
+  buffer loads with scalar tile offsets, and mask-free pair packing. 6.75 VALU/weight (was ~10.1), outputs bit-identical.
+- `GPU_MAX_HW_QUEUES=1`: default multi-queue scheduling cost the vLLM decode graph ~18 ms/step on gfx1201.
+- Multi-row GEMV (fork patch 0002): m=4 at 1.07–1.31× the cost of m=1, bitwise equal to m=1 per row.
+  MTP output is identical to plain decode.
+- Teacher-forced logits vs the fork: top-1 128/128 on both decode and prefill paths.
