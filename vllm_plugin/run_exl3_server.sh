@@ -20,7 +20,7 @@ exec podman run --rm --name vllm-exl3 \
   -v "$(realpath "$EXL3_EXT_DIR")":/exl3ext:ro \
   -v "$HOME/.cache/vllm-rdna4-exl3":/root/.cache/vllm \
   ${EXTRA_MOUNTS:-} \
-  -e PYTHONPATH=/exl3ext \
+  -e PYTHONPATH=/exl3ext -e GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-1} \
   --entrypoint bash "$IMAGE" -c "
     cp -r /plugin /tmp/plugin && pip install --no-deps --no-build-isolation -q /tmp/plugin >/dev/null &&
     exec vllm serve /model --served-model-name '$NAME' --host 0.0.0.0 --port 8000 \

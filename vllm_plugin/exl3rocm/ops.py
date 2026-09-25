@@ -13,12 +13,15 @@ to the 0011 WMMA GEMM is a separate, measured step.)
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 import torch
 
 _ext = None
 GEMM_MAX_ROWS = int(os.environ.get("EXL3_GEMM_MAX_ROWS", "1"))
 RECON_SLICE_N = int(os.environ.get("EXL3_RECON_SLICE_N", "32768"))
+# timing-only debug switch: quantized linears return zeros without running kernels
+_DEBUG_SKIP = os.environ.get("EXL3_DEBUG_SKIP_LINEAR") == "1"
 
 
 def ext():
@@ -85,18 +88,47 @@ def _(x, trellis, suh, svh, K, mcg, mul1):
 
 @torch.library.custom_op("exl3rocm::linear_groups", mutates_args=())
 def exl3_linear_groups(x: torch.Tensor, trellis: list[torch.Tensor], suh: list[torch.Tensor],
-                       svh: list[torch.Tensor], K: list[int], mcg: bool, mul1: bool) -> torch.Tensor:
+                       svh: list[torch.Tensor], K: list[int], mcg: bool, mul1: bool,
+                       ptrs_trellis: Optional[torch.Tensor] = None, ptrs_suh: Optional[torch.Tensor] = None,
+                       ptrs_svh: Optional[torch.Tensor] = None) -> torch.Tensor:
     """A fused vLLM module made of several checkpoint tensors (e.g. in_proj_qkv + in_proj_z),
     each with its own K / suh / svh. The concatenation happens inside this opaque op on
     purpose: an Inductor-traced torch.cat of per-group outputs, fused with a later slice of
     the concatenated tensor, read the slice's source buffer with the concatenated row stride
-    and ran off its end (GPU page fault, experiments/0017)."""
-    if len(trellis) == 1:
-        return exl3_linear(x, trellis[0], suh[0], svh[0], K[0], mcg, mul1)
+    and ran off its end (GPU page fault, experiments/0017).
+
+    ptrs_* = int64 device tensors of per-group data pointers, given when all groups
+    share K and width (gate/up): at M=1 one grouped exl3_mgemm computes every group, and
+    its (groups, 1, n) output is already the concatenated (1, groups*n) row."""
     k = x.shape[-1]
     widths = [s.shape[0] for s in svh]
+    if _DEBUG_SKIP:
+        return torch.zeros((*x.shape[:-1], sum(widths)), dtype=torch.float16, device=x.device)
     x2 = x.reshape(-1, k)
-    y = torch.empty((x2.shape[0], sum(widths)), dtype=torch.float16, device=x.device)
+    if x2.dtype != torch.float16:
+        x2 = x2.to(torch.float16)
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    M = x2.shape[0]
+    if len(trellis) == 1:
+        return exl3_linear(x, trellis[0], suh[0], svh[0], K[0], mcg, mul1)
+    E = ext()
+    ng = len(trellis)
+    if M == 1 and ptrs_trellis is not None:
+        y = torch.empty((ng, 1, widths[0]), dtype=torch.float16, device=x.device)
+        xh = torch.empty((ng, 1, k), dtype=torch.float16, device=x.device)
+        E.exl3_mgemm(x2.view(1, 1, k), ptrs_trellis, y, ptrs_suh, xh, ptrs_svh,
+                     None, None, K[0], -1, mcg, mul1, -1, -1, 0, 1, None, None)
+        return y.view(*x.shape[:-1], ng * widths[0])
+    y = torch.empty((M, sum(widths)), dtype=torch.float16, device=x.device)
+    if M == 1:
+        # a column slice of a single row is contiguous: write each group in place
+        xh = torch.empty_like(x2)
+        n0 = 0
+        for t, su, sv, w in zip(trellis, suh, svh, widths):
+            E.exl3_gemm(x2, t, y[:, n0:n0 + w], su, xh, sv, -1, mcg, mul1, 0)
+            n0 += w
+        return y.view(*x.shape[:-1], n0)
     n0 = 0
     for t, su, sv, kk, w in zip(trellis, suh, svh, K, widths):
         y[:, n0:n0 + w].copy_(exl3_linear(x2, t, su, sv, kk, mcg, mul1))
@@ -105,5 +137,5 @@ def exl3_linear_groups(x: torch.Tensor, trellis: list[torch.Tensor], suh: list[t
 
 
 @exl3_linear_groups.register_fake
-def _(x, trellis, suh, svh, K, mcg, mul1):
+def _(x, trellis, suh, svh, K, mcg, mul1, ptrs_trellis=None, ptrs_suh=None, ptrs_svh=None):
     return x.new_empty((*x.shape[:-1], sum(s.shape[0] for s in svh)), dtype=torch.float16)

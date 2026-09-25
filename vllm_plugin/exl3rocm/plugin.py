@@ -59,8 +59,8 @@ def _norm_key(k: str) -> str:
 
 def _read_checkpoint_layout(model_dir: str):
     """({normalized module: (K, k, n)} for every '<module>.trellis' tensor,
-        {tensor name: dtype string} for every tensor)."""
-    out, dtypes = {}, {}
+        {tensor name: dtype string}, {tensor name: shape} for every tensor)."""
+    out, dtypes, shapes = {}, {}, {}
     for f in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
         with open(f, "rb") as fh:
             n = struct.unpack("<Q", fh.read(8))[0]
@@ -69,10 +69,11 @@ def _read_checkpoint_layout(model_dir: str):
             if name == "__metadata__":
                 continue
             dtypes[name] = v["dtype"]
+            shapes[name] = tuple(v["shape"])
             if name.endswith(".trellis") and "visual" not in name.split("."):
                 s = v["shape"]
                 out[_norm_key(name[: -len(".trellis")])] = (s[-1] // 16, s[0] * 16, s[1] * 16)
-    return out, dtypes
+    return out, dtypes, shapes
 
 
 @register_quantization_config("exl3")
@@ -82,6 +83,8 @@ class Exl3Config(QuantizationConfig):
         super().__init__()
         self.codebook = codebook
         self.modules: dict[str, tuple[int, int, int]] = {}
+        self.fp8_embedding = False
+        self.embed_shape = None
 
     def __repr__(self):
         return f"Exl3Config(codebook={self.codebook}, modules={len(self.modules)})"
@@ -107,9 +110,11 @@ class Exl3Config(QuantizationConfig):
     def maybe_update_config(self, model_name: str, hf_config=None, revision=None):
         if not os.path.isdir(model_name):
             raise NotImplementedError("exl3rocm: pass a local checkpoint directory")
-        self.modules, dtypes = _read_checkpoint_layout(model_name)
-        self.fp8_embedding = any(name.endswith("embed_tokens.weight") and dt == "F8_E4M3"
-                                 for name, dt in dtypes.items())
+        self.modules, dtypes, shapes = _read_checkpoint_layout(model_name)
+        emb = [n for n, dt in dtypes.items() if n.endswith("embed_tokens.weight") and dt == "F8_E4M3"
+               and "visual" not in n.split(".")]
+        self.fp8_embedding = len(emb) == 1
+        self.embed_shape = shapes[emb[0]] if self.fp8_embedding else None
         logger.info("exl3rocm: %d EXL3 modules (%d in MTP head), fp8 input embedding: %s", len(self.modules),
                     sum(1 for k in self.modules if k.startswith("mtp.")), self.fp8_embedding)
 
@@ -252,7 +257,18 @@ class Exl3LinearMethod(LinearMethodBase):
         layer.exl3_is_mcg = layer.exl3_mcg is not None
         from .ops import reserve_weight_buffer
         k = layer.exl3_trellis_0.shape[0] * 16
-        reserve_weight_buffer(layer.exl3_trellis_0.device, max(k * min(n, ops_slice_n()) for n in layer.exl3_n))
+        dev = layer.exl3_trellis_0.device
+        reserve_weight_buffer(dev, max(k * min(n, ops_slice_n()) for n in layer.exl3_n))
+        # grouped M=1 path (exl3_mgemm) for modules whose groups share K and width (gate/up)
+        layer.exl3_mgemm_ptrs = None
+        if ng > 1 and len(set(layer.exl3_K)) == 1 and len(set(layer.exl3_n)) == 1 \
+                and os.environ.get("EXL3_MGEMM", "1") != "0":
+            def ptrs(kind):
+                t = torch.tensor([getattr(layer, f"exl3_{kind}_{i}").data_ptr() for i in range(ng)],
+                                 dtype=torch.long, device=dev)
+                layer.register_buffer(f"exl3_ptrs_{kind}", t, persistent=False)
+                return t
+            layer.exl3_mgemm_ptrs = [ptrs("trellis"), ptrs("suh"), ptrs("svh")]
         # drop the 0-size load targets so nothing downstream mistakes them for weights
         for name in ("trellis", "suh", "svh", "mul1", "mcg"):
             if name in layer._parameters:
@@ -266,7 +282,8 @@ class Exl3LinearMethod(LinearMethodBase):
             [getattr(layer, f"exl3_trellis_{i}") for i in range(ng)],
             [getattr(layer, f"exl3_suh_{i}") for i in range(ng)],
             [getattr(layer, f"exl3_svh_{i}") for i in range(ng)],
-            list(layer.exl3_K), layer.exl3_is_mcg, layer.exl3_is_mul1)
+            list(layer.exl3_K), layer.exl3_is_mcg, layer.exl3_is_mul1,
+            *(layer.exl3_mgemm_ptrs or (None, None, None)))
         if y.dtype != x.dtype:
             y = y.to(x.dtype)
         if bias is not None:
@@ -304,9 +321,77 @@ def _install_debug_module_sync():
     GPUModelRunner.load_model = load_model
 
 
+def _install_fp8_embedding_hook():
+    """Qwen3_5Model builds `embed_tokens = VocabParallelEmbedding(vocab, hidden)` without its
+    quant_config, so no quantization plugin can choose the embedding's storage and vLLM would
+    upcast the checkpoint's fp8 table to fp16 (+1.18 GiB). Inject the config for a plain
+    (non-lm_head) embedding of exactly the checkpoint's embed shape, constructed while an
+    exl3 model with an fp8 embedding is being built. Anything else is untouched."""
+    import inspect
+    from vllm.config import get_current_vllm_config_or_none
+    orig = VocabParallelEmbedding.__init__
+    sig = inspect.signature(orig)
+
+    def __init__(self, *args, **kwargs):
+        if type(self) is VocabParallelEmbedding:
+            b = sig.bind(self, *args, **kwargs)
+            cfg = get_current_vllm_config_or_none()
+            qc = getattr(cfg, "quant_config", None) if cfg is not None else None
+            if (isinstance(qc, Exl3Config) and qc.fp8_embedding and b.arguments.get("quant_config") is None
+                    and (b.arguments["num_embeddings"], b.arguments["embedding_dim"]) == qc.embed_shape):
+                b.arguments["quant_config"] = qc
+                b.arguments["prefix"] = b.arguments.get("prefix") or "embed_tokens"
+                return orig(*b.args, **b.kwargs)
+        return orig(self, *args, **kwargs)
+
+    VocabParallelEmbedding.__init__ = __init__
+
+
+def _install_debug_graph_timing():
+    """EXL3_DEBUG_GRAPH_TIME=N: time every CUDA/HIP graph replay with GPU events and log the
+    median replay time and the median interval between replay starts every N replays."""
+    import sys
+    import time
+    n_report = int(os.environ["EXL3_DEBUG_GRAPH_TIME"])
+    orig = torch.cuda.CUDAGraph.replay
+    state = {"ev": [], "wall": [], "last": None}
+
+    def replay(self):
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        now = time.perf_counter()
+        if state["last"] is not None:
+            state["wall"].append(now - state["last"])
+        state["last"] = now
+        e0.record()
+        h0 = time.perf_counter()
+        r = orig(self)
+        state.setdefault("host", []).append(time.perf_counter() - h0)
+        e1.record()
+        state["ev"].append((e0, e1))
+        if len(state["ev"]) >= n_report:
+            torch.cuda.synchronize()
+            gpu = sorted(a.elapsed_time(b) for a, b in state["ev"])
+            wall = sorted(state["wall"]) or [0.0]
+            seq = [round(a.elapsed_time(b), 1) for a, b in state["ev"]]
+            pct = lambda q: gpu[min(len(gpu) - 1, int(q * len(gpu)))]
+            print(f"[exl3dbg] graph replay GPU ms: p10 {pct(.1):.2f} p25 {pct(.25):.2f} median {pct(.5):.2f} "
+                  f"p75 {pct(.75):.2f} max {gpu[-1]:.2f} | replay-start interval ms: median "
+                  f"{wall[len(wall) // 2] * 1e3:.2f} | host replay() call ms: median "
+                  f"{sorted(state['host'])[len(state['host']) // 2] * 1e3:.2f} | first 8: {seq[:8]}",
+                  file=sys.stderr, flush=True)
+            state["ev"].clear(); state["wall"].clear(); state["host"].clear()
+        return r
+
+    torch.cuda.CUDAGraph.replay = replay
+
+
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
+    if os.environ.get("EXL3_DEBUG_GRAPH_TIME"):
+        _install_debug_graph_timing()
     from . import ops  # noqa: F401  (registers torch.ops.exl3rocm.linear)
+    if os.environ.get("EXL3_FP8_EMBEDDING", "1") != "0":
+        _install_fp8_embedding_hook()
     if os.environ.get("EXL3_DEBUG_MODULE_SYNC") == "1":
         _install_debug_module_sync()
     return None

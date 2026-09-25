@@ -11,6 +11,12 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/exl3build.XXXXXX")
 mkdir -p "$OUT"
 rsync -a --exclude build --exclude '*.egg-info' --exclude '*.so' --exclude __pycache__ --exclude .git \
   "$ROOT/vendor/rocm_exl3/" "$WORK/src/"
+# plugin-route kernel patches (on top of the vendor tree; installer profiles are untouched)
+for p in "$ROOT"/vllm_plugin/patches/exl3-fork/*.patch; do
+  [ -e "$p" ] || continue
+  (cd "$WORK/src" && git apply "$p") && echo "applied $(basename "$p") $(sha256sum "$p" | cut -c1-16)" \
+    | tee -a "$OUT/patches.txt"
+done
 (cd "$WORK/src" && find exllamav3/exllamav3_ext setup.py -type f | sort | xargs sha256sum | sha256sum) \
   | tee "$OUT/source_tree.sha256"
 podman run --rm --security-opt label=disable \

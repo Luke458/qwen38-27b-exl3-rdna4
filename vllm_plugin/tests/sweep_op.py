@@ -15,7 +15,7 @@ from exl3rocm import ops  # noqa: E402,F401
 
 model = sys.argv[1]
 Ms = [int(m) for m in sys.argv[2:]] or [1, 2, 4, 8, 16, 512, 2048]
-mods, _ = _read_checkpoint_layout(model)
+mods, _, _ = _read_checkpoint_layout(model)
 shapes = sorted({v for v in mods.values()}, key=lambda s: (s[1] * s[2]))
 print(f"{len(shapes)} distinct (K, k, n) shapes: {shapes}", flush=True)
 g = torch.Generator(device="cuda").manual_seed(1)
