@@ -1,5 +1,12 @@
 # Optimization scope after this release snapshot
 
+**Current handoff:** [agent plan](AGENT_OPTIMIZATION_PLAN.md),
+[iterative loop](ITERATIVE_OPTIMIZATION_LOOP.md), and
+[further efficiency investigation](EFFICIENCY_INVESTIGATION.md).
+The original queue below is historical: 0010's extraction-mask rewrite was
+rejected, and 0012's shared-suh concat sketch is invalid for the actual checkpoint.
+Use the linked handoff for new work.
+
 Pause kernel tuning while packaging and validating the current baseline-backed
 runtime. Preserve the frozen policy and raw paired measurements. The +4.16%
 stack is reportable as an experiment; its missed 5% median gate does not make
