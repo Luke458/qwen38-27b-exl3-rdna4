@@ -11,3 +11,35 @@ The EXL3 model weights are not included. The tested
 [GestaltLabs checkpoint](https://huggingface.co/GestaltLabs/Qwen3.8-27B-EXL3-11.5GB)
 is listed under Apache-2.0; obtain its license and attribution alongside the
 weights. This project's MIT license does not replace model or dependency terms.
+
+## 0xSero/exl3xpu (MIT)
+
+`vllm_plugin/exl3rocm/plugin.py` adapts the vLLM quantization-plugin structure of
+[0xSero/exl3xpu](https://github.com/0xSero/exl3xpu) (commit 6872a30): checkpoint-driven
+EXL3 module discovery, fused-module shard handling with per-shard input scales, and the
+plugin entry point. `experiments/0016-vllm-base/patches/gdn_attn_mask_sync.patch` ports
+its GDN metadata mask-index fix. License text:
+
+```
+MIT License
+
+Copyright (c) 2026 0xSero
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

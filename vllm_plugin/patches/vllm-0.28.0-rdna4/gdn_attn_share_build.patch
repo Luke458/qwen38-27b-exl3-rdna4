@@ -1,0 +1,146 @@
+--- patches/gdn_attn.orig.py	2026-08-25 21:52:41.000000000 +1000
++++ patches/gdn_attn_share.py	2026-09-25 08:26:11.388025260 +1000
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Backend for GatedDeltaNet attention."""
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from typing import Literal
+ 
+ import torch
+@@ -38,6 +38,7 @@
+         return True
+ 
+ 
++
+ @dataclass
+ class GDNAttentionMetadata:
+     num_prefills: int
+@@ -110,6 +111,9 @@
+             self.num_spec = 0
+         self.use_spec_decode: bool = self.num_spec > 0
+         self._init_reorder_batch_threshold(1, self.use_spec_decode)
++        # Share one build per step across GDN KV-cache groups (unified pages give
++        # every GDN layer its own group); see update_block_table.
++        self.supports_update_block_table = True
+ 
+         self.use_full_cuda_graph: bool = (
+             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+@@ -216,6 +220,7 @@
+         fast_build: bool = False,
+     ) -> GDNAttentionMetadata:
+         m = common_attn_metadata
++        num_accepted_tokens_arg = num_accepted_tokens
+ 
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+@@ -427,6 +432,8 @@
+         # token-padded for FULL graph replay, but the GDN state/query/accepted
+         # metadata below is indexed by request.
+         batch_size = m.num_reqs
++        used_spec_bufs = False
++        used_decode_bufs = False
+ 
+         if (
+             self.use_full_cuda_graph
+@@ -436,6 +443,7 @@
+             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+         ):
+             assert spec_sequence_masks is not None
++            used_spec_bufs = True
+             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
+                 spec_state_indices_tensor, non_blocking=True
+             )
+@@ -480,6 +488,7 @@
+             and num_spec_decodes == 0
+             and num_decodes <= self.decode_cudagraph_max_bs
+         ):
++            used_decode_bufs = True
+             self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                 non_spec_state_indices_tensor, non_blocking=True
+             )
+@@ -521,8 +530,83 @@
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+         )
++        attn_metadata._gdn_build_args = (
++            common_prefix_len,
++            common_attn_metadata,
++            num_accepted_tokens_arg,
++            num_decode_draft_tokens_cpu,
++            fast_build,
++        )
++        attn_metadata._gdn_seq_lens = m.seq_lens
++        attn_metadata._gdn_bufs = (used_spec_bufs, used_decode_bufs)
+         return attn_metadata
+ 
++    def update_block_table(  # type: ignore[override]
++        self,
++        metadata: GDNAttentionMetadata,
++        blk_table: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> GDNAttentionMetadata:
++        """Reuse another GDN group's build for this step; only the state
++        indices (derived from this group's block table) differ. Under FULL
++        graphs every builder owns persistent buffers that its layers' captured
++        kernels read, so the shared per-step tensors are copied into this
++        builder's buffers (device-to-device, stream-ordered). Anything with
++        prefills falls back to a full build."""
++        args = metadata._gdn_build_args
++        md = metadata
++        if md.num_prefills > 0 or (md.num_spec_decodes == 0 and md.num_decodes == 0):
++            prefix, m, acc, draft_cpu, fast = args
++            m2 = replace(m, block_table_tensor=blk_table, slot_mapping=slot_mapping)
++            return self.build(prefix, m2, num_accepted_tokens=acc,
++                              num_decode_draft_tokens_cpu=draft_cpu, fast_build=fast)
++        bt = mamba_get_block_table_tensor(
++            blk_table,
++            metadata._gdn_seq_lens,
++            self.kv_cache_spec,
++            self.vllm_config.cache_config.mamba_cache_mode,
++        )
++        new = {}
++        if md.num_spec_decodes > 0:
++            n = md.num_spec_decodes
++            src = md.spec_state_indices_tensor
++            if md._gdn_bufs[0]:
++                # source is another builder's persistent buffer -> mirror into ours
++                bs = src.shape[0]
++                dst = self.spec_state_indices_tensor[:bs]
++                dst[:n].copy_(bt[:n, : self.num_spec + 1], non_blocking=True)
++                dst[n:].fill_(NULL_BLOCK_ID)
++                new["spec_state_indices_tensor"] = dst
++                for name in ("spec_sequence_masks", "spec_token_indx",
++                             "non_spec_token_indx", "spec_query_start_loc",
++                             "num_accepted_tokens"):
++                    t = getattr(md, name)
++                    buf = getattr(self, name)[: t.shape[0]]
++                    buf.copy_(t, non_blocking=True)
++                    new[name] = buf
++            else:
++                new["spec_state_indices_tensor"] = bt[:n, : self.num_spec + 1]
++        elif md.num_decodes > 0:
++            src = md.non_spec_state_indices_tensor
++            nd = md.num_decodes
++            if md._gdn_bufs[1]:
++                bs = src.shape[0]
++                dst = self.non_spec_state_indices_tensor[:bs]
++                dst[:nd].copy_(bt[:nd, 0], non_blocking=True)
++                dst[nd:].fill_(NULL_BLOCK_ID)
++                new["non_spec_state_indices_tensor"] = dst
++                t = md.non_spec_query_start_loc
++                buf = self.non_spec_query_start_loc[: t.shape[0]]
++                buf.copy_(t, non_blocking=True)
++                new["non_spec_query_start_loc"] = buf
++            else:
++                new["non_spec_state_indices_tensor"] = bt[:, 0]
++        out = replace(md, **new)
++        out._gdn_build_args = args
++        out._gdn_seq_lens = metadata._gdn_seq_lens
++        out._gdn_bufs = md._gdn_bufs
++        return out
++
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+     ):

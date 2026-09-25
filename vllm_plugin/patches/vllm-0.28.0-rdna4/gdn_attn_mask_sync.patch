@@ -1,0 +1,86 @@
+--- gdn_attn.orig.py	2026-08-25 21:52:41.000000000 +1000
++++ gdn_attn.py	2026-09-25 08:20:46.539997555 +1000
+@@ -38,6 +38,20 @@
+         return True
+ 
+ 
++
++def _rows(t: torch.Tensor, mask_cpu: torch.Tensor) -> torch.Tensor:
++    """t[mask_cpu] for a device tensor t and CPU bool mask, without a host<->device
++    sync. All-true (pure spec decode, the hot path) is a slice; otherwise the CPU
++    indices are copied asynchronously from pinned memory. Ported from
++    0xSero/exl3xpu vllm_patches.patch_gdn_mask_index."""
++    if t.device.type == "cpu":
++        return t[mask_cpu]
++    n = mask_cpu.shape[0]
++    if bool(mask_cpu.all()):
++        return t[:n]
++    idx = mask_cpu.nonzero().squeeze(1).pin_memory().to(t.device, non_blocking=True)
++    return t.index_select(0, idx)
++
+ @dataclass
+ class GDNAttentionMetadata:
+     num_prefills: int
+@@ -305,8 +319,8 @@
+                     0, dtype=torch.int32, device=query_start_loc.device
+                 )
+                 # Filter by spec_sequence_masks to exclude padded sequences
+-                spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
++                spec_state_indices_tensor = _rows(block_table_tensor, spec_sequence_masks_cpu)[
++                    :, : self.num_spec + 1
+                 ]
+                 non_spec_state_indices_tensor = None
+                 # Padded sequences are always at the back, so the first
+@@ -326,12 +340,10 @@
+                 non_spec_token_indx = index[:num_non_spec_tokens]
+                 spec_token_indx = index[num_non_spec_tokens:]
+ 
+-                spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
+-                ]
+-                non_spec_state_indices_tensor = block_table_tensor[
+-                    ~spec_sequence_masks_cpu, 0
++                spec_state_indices_tensor = _rows(block_table_tensor, spec_sequence_masks_cpu)[
++                    :, : self.num_spec + 1
+                 ]
++                non_spec_state_indices_tensor = _rows(block_table_tensor, ~spec_sequence_masks_cpu)[:, 0]
+ 
+                 spec_query_start_loc = torch.zeros(
+                     num_spec_decodes + 1,
+@@ -339,7 +351,7 @@
+                     device=query_start_loc.device,
+                 )
+                 torch.cumsum(
+-                    query_lens[spec_sequence_masks_cpu],
++                    _rows(query_lens, spec_sequence_masks_cpu),
+                     dim=0,
+                     out=spec_query_start_loc[1:],
+                 )
+@@ -349,7 +361,7 @@
+                     device=query_start_loc.device,
+                 )
+                 torch.cumsum(
+-                    query_lens[~spec_sequence_masks_cpu],
++                    _rows(query_lens, ~spec_sequence_masks_cpu),
+                     dim=0,
+                     out=non_spec_query_start_loc[1:],
+                 )
+@@ -364,7 +376,7 @@
+                 )
+ 
+             assert num_accepted_tokens is not None
+-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
++            num_accepted_tokens = _rows(num_accepted_tokens, spec_sequence_masks_cpu)
+ 
+         chunk_indices: torch.Tensor | None = None
+         chunk_offsets: torch.Tensor | None = None
+@@ -402,7 +414,7 @@
+             context_lens_tensor = m.compute_num_computed_tokens()
+             has_initial_state = context_lens_tensor > 0
+             if spec_sequence_masks_cpu is not None:
+-                has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
++                has_initial_state = _rows(has_initial_state, ~spec_sequence_masks_cpu)
+                 assert non_spec_query_start_loc_cpu is not None
+             nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                 compute_causal_conv1d_metadata(
