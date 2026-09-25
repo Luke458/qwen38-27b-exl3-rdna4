@@ -9,22 +9,23 @@ The target checkpoint is mixed-bitrate; kernel optimisation focuses on its
 
 ## Status
 
-Single-user inference works. The experimental fused/unrolled FP16 implementation
-measured **1.0416× decode throughput** in ten paired trials, below the predeclared
-1.05× promotion threshold. The baseline remains the default. The separate int8
-experiment was slower and stays disabled. See [measured status](docs/STATUS.md)
-and [next optimisation work](docs/OPTIMIZATION.md).
+**Recommended: the vLLM plugin** in [`vllm_plugin/`](vllm_plugin/README.md). It serves this checkpoint
+through vLLM 0.28 (community rdna4 image, podman) with EXL3 kernels from the fork, all within 16 GB:
 
-## vLLM plugin (fast path)
+- **~80 tok/s single stream** with native MTP-3 speculative decoding (16k context, vision loaded)
+- ~200 tok/s aggregate at 8 streams, or up to 64k context, without MTP
+- int8 KV cache, vision, reasoning and tool-call parsing
 
-[`vllm_plugin/`](vllm_plugin/README.md) serves the same checkpoint through vLLM 0.28
-(community rdna4 image, podman) with EXL3 kernels from the fork: **~80 tok/s single
-stream with native MTP-3**, ~200 tok/s aggregate at 8 streams, int8 KV cache, up to
-64k context, plus vision, reasoning and tool-call parsing, all within 16 GB. It is experimental and has been
-tested only on this card and checkpoint. See [the port assessment](docs/VLLM_PORT_ASSESSMENT.md)
+It is experimental and has been tested only on this card and checkpoint. See [the port assessment](docs/VLLM_PORT_ASSESSMENT.md)
 and [the decode trace](docs/DECODE_TRACE.md).
 
-## Quickstart
+The original exllamav3-fork server below still works for single users (about 29 tok/s decode). There, the
+experimental fused/unrolled FP16 implementation measured **1.0416× decode throughput** in ten paired
+trials, below the predeclared 1.05× promotion threshold, so the baseline remains its default. The separate
+int8 experiment was slower and stays disabled. See [measured status](docs/STATUS.md) and
+[next optimisation work](docs/OPTIMIZATION.md).
+
+## Quickstart (exllamav3 fork server)
 
 Prerequisites: Linux with a working ROCm **7.2.4** installation at `/opt/rocm`,
 RX 9070 XT device access, Git, Python 3, and [uv](https://docs.astral.sh/uv/).
