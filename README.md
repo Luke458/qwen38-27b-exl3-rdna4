@@ -19,13 +19,13 @@ through vLLM 0.28 (community rdna4 image, podman) with EXL3 kernels from the for
 It is experimental and has been tested only on this card and checkpoint. See [the port assessment](docs/VLLM_PORT_ASSESSMENT.md)
 and [the decode trace](docs/DECODE_TRACE.md).
 
-The original exllamav3-fork server below still works for single users (about 29 tok/s decode). There, the
+The original standalone server (`tools/serve.py`, below) still works for single users (about 29 tok/s decode). There, the
 experimental fused/unrolled FP16 implementation measured **1.0416× decode throughput** in ten paired
 trials, below the predeclared 1.05× promotion threshold, so the baseline remains its default. The separate
 int8 experiment was slower and stays disabled. See [measured status](docs/STATUS.md) and
 [next optimisation work](docs/OPTIMIZATION.md).
 
-## Quickstart (exllamav3 fork server)
+## Quickstart (standalone server)
 
 Prerequisites: Linux with a working ROCm **7.2.4** installation at `/opt/rocm`,
 RX 9070 XT device access, Git, Python 3, and [uv](https://docs.astral.sh/uv/).

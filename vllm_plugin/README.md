@@ -1,9 +1,9 @@
 # exl3rocm: EXL3 weights in vLLM on the RX 9070 XT (gfx1201)
 
-An out-of-tree vLLM quantization plugin that serves EXL3 (exllamav3 trellis)
+An out-of-tree vLLM quantization plugin that serves EXL3 (trellis-quantized)
 checkpoints on RDNA4, on top of the community
 [vllm-rocm-rdna4](https://github.com/Capicua25x/vllm-rocm-rdna4) 0.28.0 image.
-It reuses the exllamav3 ROCm fork's kernels (`vendor/rocm_exl3`). The plugin
+It reuses the kernels of the pinned ROCm fork in `vendor/rocm_exl3`. The plugin
 structure is adapted from [0xSero/exl3xpu](https://github.com/0xSero/exl3xpu) (MIT).
 
 Status: experimental. Tested only with the GestaltLabs Qwen3.8-27B EXL3 11.5 GB
@@ -14,10 +14,10 @@ checkpoint, one GPU (text, single images, reasoning/tool parsing). See `docs/VLL
 | path | what |
 |---|---|
 | `exl3rocm/plugin.py` | `exl3` quantization config, per-checkpoint-tensor ("group") linear method, fp8 embedding method |
-| `exl3rocm/ops.py` | opaque torch custom ops over `exllamav3_ext` |
+| `exl3rocm/ops.py` | opaque torch custom ops over the compiled kernel extension |
 | `exl3rocm/kv_dequant.py` | Triton gather + dequantize of 8-bit KV blocks for prefill attention |
 | `run_exl3_server.sh` | podman launcher for an EXL3 checkpoint |
-| `tools/build_ext_in_image.sh` | build `exllamav3_ext` against the image's torch |
+| `tools/build_ext_in_image.sh` | build the kernel extension against the image's torch |
 | `tools/run_base_server.sh` | launcher for unquantized models (engine baselines) |
 | `tools/bench_client.py` | single-stream decode benchmark (OpenAI API) |
 | `tools/longctx_bench.py`, `tools/concurrency_bench.py` | long-prompt prefill/decode, concurrent streams |
@@ -69,7 +69,7 @@ Prefill is about 1.3–1.9k tok/s (2,048-token chunks; GEMM-bound, `hgemm_recon`
 off by batch size (`disable_by_batch_size` is not in V1), so there are two profiles.
 
 **Vision, reasoning and tools** (verified 2026-09-25): the vision tower uses EXL3 6-bit throughout, with the MLP built
-at the EXL3-padded width, as exllamav3 does. A synthetic test image (red circle, blue square, "42") was described
+at the EXL3-padded width. A synthetic test image (red circle, blue square, "42") was described
 correctly. Add `--reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder` for separated
 thinking and OpenAI tool calls (both verified).
 
