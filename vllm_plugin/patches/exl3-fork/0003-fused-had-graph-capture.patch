@@ -1,0 +1,71 @@
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_rdna.hip
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_rdna.hip
+@@ -183,18 +183,25 @@
+     return env && atoi(env) != 0;
+ }
+ 
+-// Per-(device, stream) completion counters: one int per 128-column group.
+-// Zeroed at allocation and self-reset by the completing block. Never allocated
+-// mid-capture (the non-graph path is declined while a graph captures).
+-static int* exl3_gemv_had_counters(int device, cudaStream_t stream, int groups)
++// Per-device completion counters: one int per 128-column group. Zeroed at
++// allocation and self-reset by the completing block, so a captured graph can
++// replay them. Shared by every fused GEMV on the device, which is safe while
++// they execute in stream order (one compute stream; vLLM decode). Never
++// allocated mid-capture: allow_alloc = false returns nullptr when absent or too
++// small, and the caller declines to the three-launch form (experiments/0021).
++static int* exl3_gemv_had_counters(int device, cudaStream_t stream, int groups, bool allow_alloc = true)
+ {
+     static std::mutex mtx;
+-    static std::map<std::pair<int, cudaStream_t>, std::pair<int*, int>> blocks;
++    static std::map<int, std::pair<int*, int>> blocks;
+     std::lock_guard<std::mutex> lock(mtx);
+-    auto key = std::make_pair(device, stream);
++    (void) stream;
++    auto key = device;
+     auto it = blocks.find(key);
+     if (it == blocks.end() || it->second.second < groups)
+     {
++        if (!allow_alloc) return nullptr;
++        // grow to at least the lm_head width so capture never finds it too small
++        if (groups < 2048) groups = 2048;
+         void* p = nullptr;
+         if (cudaMalloc(&p, (size_t) groups * sizeof(int)) != cudaSuccess)
+         {
+@@ -279,18 +286,17 @@
+     // candidate 0008: output-transform-fused launch (counters per 128-group)
+     bool fused_had = svh_ptr && exl3_gemv_fused_had_enabled();
+     int* had_counters = nullptr;
++    bool capturing = false;
+     if (fused_had)
+     {
+-        // capture-safe: the counters allocation must never happen mid-capture
+-        // (hipMalloc invalidates an active stream capture), and a captured
+-        // sequence cannot be re-run with per-call counters anyway -- decline
+-        // to the proven 3-launch form exactly like exl3_gemv_int8 does
++        // capture-safe: never allocate mid-capture (hipMalloc invalidates an
++        // active stream capture). Self-resetting per-device counters allocated
++        // earlier (warmup) replay correctly; if absent, decline to 3 launches.
+         hipStreamCaptureStatus capture_status;
+-        if (hipStreamIsCapturing(stream, &capture_status) != hipSuccess ||
+-            capture_status != hipStreamCaptureStatusNone)
+-        {
++        if (hipStreamIsCapturing(stream, &capture_status) != hipSuccess)
+             fused_had = false;
+-        }
++        else
++            capturing = capture_status != hipStreamCaptureStatusNone;
+     }
+     if (fused_had)
+     {
+@@ -308,8 +314,8 @@
+         }
+         int device = 0;
+         cudaGetDevice(&device);
+-        had_counters = exl3_gemv_had_counters(device, stream, size_n / 128);
+-        if (!had_counters) return;   // allocation failure: caller falls through
++        had_counters = exl3_gemv_had_counters(device, stream, size_n / 128, !capturing);
++        if (!had_counters) fused_had = false;   // absent under capture / alloc failure: 3 launches
+     }
+ 
+     #define LAUNCH_GEMV_WAVES_K(bits_val, codebook, warps, kernel_name) \

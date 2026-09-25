@@ -10,23 +10,25 @@
  #include "quant/exl3_gemv_int8.cuh"
  #include "cpu/moe_mul1.h"
  #include "cpu/moe_handoff.h"
-@@ -151,6 +154,10 @@
+@@ -151,6 +154,11 @@
      m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
      m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
      m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
 +#ifdef USE_ROCM
 +    m.def("exl3_gemv_mr", &exl3_gemv_mr, "exl3_gemv_mr");
 +    m.def("exl3_gemv_mr_supported", &exl3_gemv_mr_supported, "exl3_gemv_mr_supported");
++    m.def("exl3_gemv_mr_grouped", &exl3_gemv_mr_grouped, "exl3_gemv_mr_grouped");
 +#endif
      m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
      m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
      m.def("g_get_cc", &g_get_cc, "g_get_cc");
 --- /dev/null
 +++ b/exllamav3/exllamav3_ext/quant/exl3_gemv_mr.cuh
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,40 @@
 +#pragma once
 +
 +#include <ATen/Tensor.h>
++#include <vector>
 +
 +// Multi-row (1 <= m <= EXL3_GEMV_MR_MAX) EXL3 GEMV, ROCm only (rocm/quant/exl3_gemv_mr_rdna.hip).
 +// Each row's output is bitwise identical to the m == 1 GEMV of that row.
@@ -46,9 +48,26 @@
 +    bool mcg,
 +    bool mul1
 +);
++
++// Up to 4 groups sharing x, with equal K / k / n (e.g. gate/up): one launch per stage.
++// bszm_for_warps selects the split-K wave count exactly as the m == 1 path of the module does
++// (group count if that path is the grouped mgemv, else 1), keeping rows bitwise equal to it.
++void exl3_gemv_mr_grouped
++(
++    const at::Tensor& A,
++    const std::vector<at::Tensor>& B,
++    at::Tensor& C,
++    const std::vector<at::Tensor>& suh,
++    at::Tensor& A_had,
++    const std::vector<at::Tensor>& svh,
++    int K,
++    bool mcg,
++    bool mul1,
++    int bszm_for_warps
++);
 --- /dev/null
 +++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_mr_rdna.hip
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,369 @@
 +// =============================================================================
 +// Multi-row EXL3 GEMV (2 <= m <= 8) for speculative-decoding verify / small batches
 +// =============================================================================
@@ -147,14 +166,27 @@
 +    }
 +}
 +
-+// Split-K form: one block per n-tile, WARPS warps share the k range (== m1 splitk kernel)
++// -----------------------------------------------------------------------------
++// Groups: up to EXL3_GEMV_MRG_MAX matrices with equal K / k / n, one launch, gridDim.y =
++// group. Each group has its own trellis, rotated input (own suh), output columns (own svh).
++// A single matrix is one group.
++// -----------------------------------------------------------------------------
++#define EXL3_GEMV_MRG_MAX 4
++struct Exl3MrGroups
++{
++    const uint16_t* B[EXL3_GEMV_MRG_MAX];     // trellis per group
++    half* Ah[EXL3_GEMV_MRG_MAX];              // rotated input per group, [m][k]
++    half* C[EXL3_GEMV_MRG_MAX];               // output per group (column-offset pointer, row stride ldc)
++    const half* suh[EXL3_GEMV_MRG_MAX];
++    const half* svh[EXL3_GEMV_MRG_MAX];
++};
++
++// Split-K form: one block per (n-tile, group), WARPS warps share the k range (== m1 splitk kernel)
 +template <int bits, int cb, int WARPS, int MR>
 +__global__ __launch_bounds__(WARPS * 32)
 +void exl3_gemv_mr_splitk_kernel
 +(
-+    const half* __restrict__ A,
-+    const uint16_t* __restrict__ B,
-+    half* __restrict__ C,
++    const Exl3MrGroups g,
 +    const int size_k,
 +    const int size_n,
 +    const int m,
@@ -164,7 +196,11 @@
 +    const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
 +    const int lane = threadIdx.x % 32;
 +    const int tile_n = blockIdx.x;
++    const int grp = blockIdx.y;
 +    const int n_tiles = size_n / 16;
++    const half* A = g.Ah[grp];
++    const uint16_t* B = g.B[grp];
++    half* C = g.C[grp];
 +
 +    __shared__ float sh_red[WARPS * 16 * MR];
 +
@@ -204,23 +240,24 @@
 +__global__ __launch_bounds__(WARPS * 32)
 +void exl3_gemv_mr_kernel
 +(
-+    const half* __restrict__ A,
-+    const uint16_t* __restrict__ B,
-+    half* __restrict__ C,
++    const Exl3MrGroups g,
 +    const int size_k,
 +    const int size_n,
 +    const int m,
-+    const int ldc                      // output row stride (elements)
++    const int ldc
 +)
 +{
 +    const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
 +    const int lane = threadIdx.x % 32;
 +    const int tile_n = blockIdx.x * WARPS + warp_id;
++    const int grp = blockIdx.y;
 +    const int n_tiles = size_n / 16;
 +    if (tile_n >= n_tiles) return;
++    half* C = g.C[grp];
 +
 +    float acc[MR];
-+    exl3_gemv_dot_tile_direct_mr<bits, cb, MR>(A, B, n_tiles, tile_n, lane, 0, size_k / 16, m, size_k, acc);
++    exl3_gemv_dot_tile_direct_mr<bits, cb, MR>(g.Ah[grp], g.B[grp], n_tiles, tile_n, lane, 0, size_k / 16, m,
++                                               size_k, acc);
 +    if (lane < 16)
 +    {
 +        #pragma unroll
@@ -229,23 +266,22 @@
 +    }
 +}
 +
-+// Hadamards over [m][size] as independent 128-chunks; scale index wraps per row
++// Hadamards over [m][size] as independent 128-chunks; scale index wraps per row; group = blockIdx.z (had_*_r_128_inner indexes its scale pointer with blockIdx.y, which must stay 0)
 +static __global__ __launch_bounds__(256)
-+void exl3_gemv_mr_had_in_kernel(const half* __restrict__ in, half* __restrict__ out,
-+                                const half* __restrict__ scales, const int size, const int total)
++void exl3_gemv_mr_had_in_kernel(const half* __restrict__ in, const Exl3MrGroups g,
++                                const int size, const int total)
 +{
 +    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
 +    if (warp < total / 128)
 +    {
 +        int off = warp * 128;
-+        had_hf_r_128_inner<true, false>(in + off, out + off, scales + off % size, 0.088388347648f);
++        had_hf_r_128_inner<true, false>(in + off, g.Ah[blockIdx.z] + off, g.suh[blockIdx.z] + off % size,
++                                        0.088388347648f);
 +    }
 +}
 +
 +static __global__ __launch_bounds__(256)
-+void exl3_gemv_mr_had_out_kernel(const half* __restrict__ in, half* __restrict__ out,
-+                                 const half* __restrict__ scales, const int size, const int total,
-+                                 const int ldc)
++void exl3_gemv_mr_had_out_kernel(const Exl3MrGroups g, const int size, const int total, const int ldc)
 +{
 +    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
 +    if (warp < total / 128)
@@ -253,7 +289,8 @@
 +        int off = warp * 128;
 +        int row = off / size, col = off % size;
 +        size_t p = (size_t) row * ldc + col;
-+        had_hf_r_128_inner<false, true>(in + p, out + p, scales + col, 0.088388347648f);
++        half* C = g.C[blockIdx.z];
++        had_hf_r_128_inner<false, true>(C + p, C + p, g.svh[blockIdx.z] + col, 0.088388347648f);
 +    }
 +}
 +
@@ -261,42 +298,111 @@
 +// Host
 +// -----------------------------------------------------------------------------
 +template <int bits, int WARPS, int MR>
-+static void launch_mr(bool splitk, int n_tiles, const half* A, const uint16_t* B, half* C,
++static void launch_mr(bool splitk, int n_tiles, int groups, const Exl3MrGroups& g,
 +                      int k, int n, int m, int ldc, cudaStream_t stream)
 +{
 +    if (splitk)
-+        hipLaunchKernelGGL((exl3_gemv_mr_splitk_kernel<bits, 2, WARPS, MR>), dim3(n_tiles), dim3(WARPS * 32),
-+                           0, stream, A, B, C, k, n, m, ldc);
++        hipLaunchKernelGGL((exl3_gemv_mr_splitk_kernel<bits, 2, WARPS, MR>), dim3(n_tiles, groups), dim3(WARPS * 32),
++                           0, stream, g, k, n, m, ldc);
 +    else
-+        hipLaunchKernelGGL((exl3_gemv_mr_kernel<bits, 2, 4, MR>), dim3((n_tiles + 3) / 4), dim3(4 * 32),
-+                           0, stream, A, B, C, k, n, m, ldc);
++        hipLaunchKernelGGL((exl3_gemv_mr_kernel<bits, 2, 4, MR>), dim3((n_tiles + 3) / 4, groups), dim3(4 * 32),
++                           0, stream, g, k, n, m, ldc);
 +}
 +
 +template <int bits, int MR>
-+static void launch_mr_w(bool splitk, int warps, int n_tiles, const half* A, const uint16_t* B, half* C,
++static void launch_mr_w(bool splitk, int warps, int n_tiles, int groups, const Exl3MrGroups& g,
 +                        int k, int n, int m, int ldc, cudaStream_t stream)
 +{
 +    switch (warps)
 +    {
-+        case 4:  launch_mr<bits, 4, MR>(splitk, n_tiles, A, B, C, k, n, m, ldc, stream); break;
-+        case 8:  launch_mr<bits, 8, MR>(splitk, n_tiles, A, B, C, k, n, m, ldc, stream); break;
-+        default: launch_mr<bits, 16, MR>(splitk, n_tiles, A, B, C, k, n, m, ldc, stream); break;
++        case 4:  launch_mr<bits, 4, MR>(splitk, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        case 8:  launch_mr<bits, 8, MR>(splitk, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        default: launch_mr<bits, 16, MR>(splitk, n_tiles, groups, g, k, n, m, ldc, stream); break;
 +    }
 +}
 +
 +template <int bits>
-+static void launch_mr_bits(bool splitk, int warps, int n_tiles, const half* A, const uint16_t* B, half* C,
++static void launch_mr_bits(bool splitk, int warps, int n_tiles, int groups, const Exl3MrGroups& g,
 +                           int k, int n, int m, int ldc, cudaStream_t stream)
 +{
-+    if (m <= 2)      launch_mr_w<bits, 2>(splitk, warps, n_tiles, A, B, C, k, n, m, ldc, stream);
-+    else if (m <= 4) launch_mr_w<bits, 4>(splitk, warps, n_tiles, A, B, C, k, n, m, ldc, stream);
-+    else             launch_mr_w<bits, 8>(splitk, warps, n_tiles, A, B, C, k, n, m, ldc, stream);
++    if (m <= 2)      launch_mr_w<bits, 2>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
++    else if (m <= 4) launch_mr_w<bits, 4>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
++    else             launch_mr_w<bits, 8>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
 +}
 +
 +bool exl3_gemv_mr_supported(int m, int k, int n, int K, bool mcg, bool mul1)
 +{
 +    return m >= 1 && m <= EXL3_GEMV_MR_MAX && K >= 1 && K <= 8 && mul1 && !mcg
 +        && k % 128 == 0 && n % 128 == 0;
++}
++
++// Core: groups share x [m, k]; group i writes columns [i*n, (i+1)*n) of C (row stride ldc).
++// bszm_for_warps: the split-K wave count is exl3_gemv_splitk_warps(k_tiles, n_tiles, bszm) --
++// pass the group count when the module's m=1 path is the grouped mgemv (same k ranges, so
++// rows stay bitwise equal to it), 1 when its m=1 path is the single-matrix GEMV.
++static void exl3_gemv_mr_core
++(
++    const at::Tensor& A, const std::vector<at::Tensor>& B, at::Tensor& C,
++    const std::vector<at::Tensor>& suh, at::Tensor& A_had, const std::vector<at::Tensor>& svh,
++    int K, bool mcg, bool mul1, int bszm_for_warps
++)
++{
++    const at::cuda::OptionalCUDAGuard device_guard(A.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    const int groups = (int) B.size();
++    const int k = A.size(-1);
++    const int m = A.numel() / k;
++    TORCH_CHECK(groups >= 1 && groups <= EXL3_GEMV_MRG_MAX && (int) suh.size() == groups
++                && (int) svh.size() == groups, "exl3_gemv_mr: 1..4 groups with suh/svh each");
++    const int n = svh[0].size(0);
++    TORCH_CHECK(C.size(-1) >= groups * n, "exl3_gemv_mr: output narrower than groups * n");
++    TORCH_CHECK(exl3_gemv_mr_supported(m, k, n, K, mcg, mul1), "exl3_gemv_mr: unsupported call");
++    TORCH_CHECK(A.is_contiguous() && A_had.is_contiguous() && C.stride(-1) == 1,
++                "exl3_gemv_mr: contiguous A / A_had, unit-stride C rows");
++    TORCH_CHECK(A_had.numel() >= (int64_t) groups * m * k, "exl3_gemv_mr: A_had too small");
++    TORCH_CHECK(A.scalar_type() == at::kHalf && C.scalar_type() == at::kHalf, "exl3_gemv_mr: fp16 only");
++    const int ldc = C.dim() >= 2 ? (int) C.stride(-2) : n;
++
++    Exl3MrGroups g {};
++    for (int i = 0; i < groups; ++i)
++    {
++        TORCH_CHECK(B[i].size(0) * 16 == k && B[i].size(1) * 16 == n && B[i].size(2) == 16 * K,
++                    "exl3_gemv_mr: trellis shape");
++        TORCH_CHECK(svh[i].size(0) == n, "exl3_gemv_mr: groups must share n");
++        g.B[i] = (const uint16_t*) B[i].data_ptr();
++        g.Ah[i] = (half*) A_had.data_ptr() + (size_t) i * m * k;
++        g.C[i] = (half*) C.data_ptr() + (size_t) i * n;
++        g.suh[i] = (const half*) suh[i].data_ptr();
++        g.svh[i] = (const half*) svh[i].data_ptr();
++    }
++
++    {
++        int warps = m * k / 128;
++        hipLaunchKernelGGL(exl3_gemv_mr_had_in_kernel, dim3((warps + 7) / 8, 1, groups), dim3(256), 0, stream,
++                           (const half*) A.data_ptr(), g, k, m * k);
++    }
++
++    const int n_tiles = n / 16;
++    const int k_tiles = k / 16;
++    const bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
++    const int warps = splitk ? exl3_gemv_splitk_warps(k_tiles, n_tiles, bszm_for_warps) : 4;
++    switch (K)
++    {
++        case 1: launch_mr_bits<1>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        case 2: launch_mr_bits<2>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        case 3: launch_mr_bits<3>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        case 4: launch_mr_bits<4>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        case 5: launch_mr_bits<5>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        case 6: launch_mr_bits<6>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        case 7: launch_mr_bits<7>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++        default: launch_mr_bits<8>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream); break;
++    }
++
++    {
++        int warps_o = m * n / 128;
++        hipLaunchKernelGGL(exl3_gemv_mr_had_out_kernel, dim3((warps_o + 7) / 8, 1, groups), dim3(256), 0, stream,
++                           g, n, m * n, ldc);
++    }
 +}
 +
 +void exl3_gemv_mr
@@ -312,47 +418,22 @@
 +    bool mul1
 +)
 +{
-+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
-+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-+    const int k = A.size(-1);
-+    const int m = A.numel() / k;
-+    const int n = C.size(-1);
-+    TORCH_CHECK(exl3_gemv_mr_supported(m, k, n, K, mcg, mul1), "exl3_gemv_mr: unsupported call");
-+    TORCH_CHECK(A.is_contiguous() && A_had.is_contiguous() && C.stride(-1) == 1, "exl3_gemv_mr: contiguous A, unit-stride C rows");
-+    const int ldc = C.dim() >= 2 ? (int) C.stride(-2) : n;
-+    TORCH_CHECK(A.scalar_type() == at::kHalf && C.scalar_type() == at::kHalf, "exl3_gemv_mr: fp16 only");
-+    TORCH_CHECK(B.size(0) * 16 == k && B.size(1) * 16 == n && B.size(2) == 16 * K, "exl3_gemv_mr: trellis shape");
++    exl3_gemv_mr_core(A, {B}, C, {suh}, A_had, {svh}, K, mcg, mul1, 1);
++}
 +
-+    const half* A_ptr = (const half*) A.data_ptr();
-+    half* Ah_ptr = (half*) A_had.data_ptr();
-+    half* C_ptr = (half*) C.data_ptr();
-+    const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
-+
-+    {
-+        int warps = m * k / 128;
-+        hipLaunchKernelGGL(exl3_gemv_mr_had_in_kernel, dim3((warps + 7) / 8), dim3(256), 0, stream,
-+                           A_ptr, Ah_ptr, (const half*) suh.data_ptr(), k, m * k);
-+    }
-+
-+    const int n_tiles = n / 16;
-+    const int k_tiles = k / 16;
-+    const bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
-+    const int warps = splitk ? exl3_gemv_splitk_warps(k_tiles, n_tiles, 1) : 4;
-+    switch (K)
-+    {
-+        case 1: launch_mr_bits<1>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+        case 2: launch_mr_bits<2>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+        case 3: launch_mr_bits<3>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+        case 4: launch_mr_bits<4>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+        case 5: launch_mr_bits<5>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+        case 6: launch_mr_bits<6>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+        case 7: launch_mr_bits<7>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+        default: launch_mr_bits<8>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
-+    }
-+
-+    {
-+        int warps_o = m * n / 128;
-+        hipLaunchKernelGGL(exl3_gemv_mr_had_out_kernel, dim3((warps_o + 7) / 8), dim3(256), 0, stream,
-+                           C_ptr, C_ptr, (const half*) svh.data_ptr(), n, m * n, ldc);
-+    }
++void exl3_gemv_mr_grouped
++(
++    const at::Tensor& A,                    // [m, k] fp16, shared input
++    const std::vector<at::Tensor>& B,       // G trellises, equal K / k / n
++    at::Tensor& C,                          // [m, >= G*n]; group i -> columns [i*n, (i+1)*n)
++    const std::vector<at::Tensor>& suh,
++    at::Tensor& A_had,                      // [G, m, k] scratch
++    const std::vector<at::Tensor>& svh,
++    int K,
++    bool mcg,
++    bool mul1,
++    int bszm_for_warps
++)
++{
++    exl3_gemv_mr_core(A, B, C, suh, A_had, svh, K, mcg, mul1, bszm_for_warps);
 +}

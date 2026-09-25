@@ -142,12 +142,25 @@ def exl3_linear_groups(x: torch.Tensor, trellis: list[torch.Tensor], suh: list[t
         return y.view(*x.shape[:-1], n0)
     if M <= MR_MAX and _has_mr(E) and all(E.exl3_gemv_mr_supported(M, k, w, kk, mcg, mul1)
                                            for w, kk in zip(widths, K)):
-        # multi-row GEMV writes each group straight into its (row-strided) column slice
-        xh = torch.empty_like(x2)
-        n0 = 0
-        for t, su, sv, kk, w in zip(trellis, suh, svh, K, widths):
-            E.exl3_gemv_mr(x2, t, y[:, n0:n0 + w], su, xh, sv, kk, mcg, mul1)
-            n0 += w
+        # multi-row GEMV writes each group straight into its (row-strided) column slice; runs of
+        # consecutive groups with equal (K, width) share one grouped launch (gate/up, k/v). The
+        # split-K wave count follows the module's m=1 path so rows stay bitwise equal to it:
+        # grouped mgemm (bszm = group count) when ptrs are given, single-matrix GEMVs otherwise.
+        grouped = hasattr(E, "exl3_gemv_mr_grouped")
+        bszm = ng if ptrs_trellis is not None else 1
+        xh = torch.empty((min(ng, 4), M, k), dtype=torch.float16, device=x.device)
+        i, n0 = 0, 0
+        while i < ng:
+            j = i + 1
+            while grouped and j < ng and j - i < 4 and K[j] == K[i] and widths[j] == widths[i]:
+                j += 1
+            if j - i > 1:
+                E.exl3_gemv_mr_grouped(x2, list(trellis[i:j]), y[:, n0:], list(suh[i:j]), xh,
+                                       list(svh[i:j]), K[i], mcg, mul1, bszm)
+            else:
+                E.exl3_gemv_mr(x2, trellis[i], y[:, n0:n0 + widths[i]], suh[i], xh[0], svh[i], K[i], mcg, mul1)
+            n0 += sum(widths[i:j])
+            i = j
         return y.view(*x.shape[:-1], n0)
     n0 = 0
     for t, su, sv, kk, w in zip(trellis, suh, svh, K, widths):

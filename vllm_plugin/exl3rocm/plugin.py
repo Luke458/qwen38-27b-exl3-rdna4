@@ -173,6 +173,14 @@ class Exl3LinearMethod(LinearMethodBase):
     def __init__(self, config: Exl3Config, groups):
         self.config = config
         self.groups = groups  # [(member_key, K, k, n)]
+        # pruned draft head only when a speculative (MTP) config is active
+        self._drafting = False
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+            cfg = get_current_vllm_config_or_none()
+            self._drafting = cfg is not None and cfg.speculative_config is not None
+        except Exception:
+            pass
 
     def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size,
                        output_size, params_dtype, **extra_weight_attrs):
@@ -269,6 +277,8 @@ class Exl3LinearMethod(LinearMethodBase):
                 layer.register_buffer(f"exl3_ptrs_{kind}", t, persistent=False)
                 return t
             layer.exl3_mgemm_ptrs = [ptrs("trellis"), ptrs("suh"), ptrs("svh")]
+        if isinstance(layer, ParallelLMHead) and self._drafting:
+            _build_draft_head(layer)
         # drop the 0-size load targets so nothing downstream mistakes them for weights
         for name in ("trellis", "suh", "svh", "mul1", "mcg"):
             if name in layer._parameters:
@@ -347,6 +357,81 @@ def _install_fp8_embedding_hook():
     VocabParallelEmbedding.__init__ = __init__
 
 
+def _draft_blocks(n_blocks_total: int) -> list[int]:
+    """Output blocks (128 columns = 1 Hadamard block) scored by the MTP drafter: the first
+    EXL3_DRAFT_VOCAB_BLOCKS blocks (BPE ids are roughly frequency-ordered; the first 640 cover
+    >99.9% of tokens in local prose/code samples) plus the last 16 blocks (special / chat tokens)."""
+    n = int(os.environ.get("EXL3_DRAFT_VOCAB_BLOCKS", "640"))
+    if n <= 0 or n >= n_blocks_total:
+        return []
+    return sorted(set(range(n)) | set(range(max(n, n_blocks_total - 16), n_blocks_total)))
+
+
+def _build_draft_head(layer):
+    """Pruned copy of the lm_head for the MTP drafter (target verification keeps the full head,
+    so generated text is unchanged; only draft acceptance can drop). Adapted from exl3xpu."""
+    if len(layer.exl3_n) != 1:
+        return
+    n = layer.exl3_n[0]
+    blocks = _draft_blocks(n // 128)
+    if not blocks:
+        return
+    dev = layer.exl3_trellis_0.device
+    b = torch.tensor(blocks, dtype=torch.long, device=dev)
+    tiles = (b[:, None] * 8 + torch.arange(8, device=dev)[None, :]).flatten()
+    cols = (b[:, None] * 128 + torch.arange(128, device=dev)[None, :]).flatten()
+    layer.register_buffer("exl3_draft_trellis", layer.exl3_trellis_0.index_select(1, tiles).contiguous(),
+                          persistent=False)
+    layer.register_buffer("exl3_draft_svh", layer.exl3_svh_0.index_select(0, cols).contiguous(), persistent=False)
+    layer.register_buffer("exl3_draft_cols", cols, persistent=False)
+    logger.info("exl3rocm: MTP draft head scores %d of %d vocab blocks (%.1f%%)", len(blocks), n // 128,
+                100.0 * len(blocks) / (n // 128))
+
+
+def _install_draft_logits_patch():
+    try:
+        from vllm.model_executor.models import qwen3_5_mtp
+    except Exception:
+        return
+    cls = qwen3_5_mtp.Qwen3_5MTP
+    if getattr(cls, "_exl3_patched", False):
+        return
+    orig = cls.compute_logits
+
+    def compute_logits(self, hidden_states, spec_step_idx: int = 0):
+        lm = self.lm_head
+        if getattr(lm, "exl3_draft_trellis", None) is None:
+            return orig(self, hidden_states, spec_step_idx)
+        from . import ops  # noqa: F401
+        sub = torch.ops.exl3rocm.linear(hidden_states, lm.exl3_draft_trellis, lm.exl3_suh_0, lm.exl3_draft_svh,
+                                        lm.exl3_K[0], lm.exl3_is_mcg, lm.exl3_is_mul1)
+        logits = sub.new_full((sub.shape[0], lm.exl3_n[0]), float("-inf"))
+        logits.index_copy_(1, lm.exl3_draft_cols, sub)
+        return logits[:, : self.config.vocab_size].to(hidden_states.dtype)
+
+    cls.compute_logits = compute_logits
+
+    # greedy drafting goes through get_top_tokens (LocalArgmaxMixin), not compute_logits:
+    # argmax over the pruned columns, mapped back to vocab ids (no full-vocab tensor at all)
+    orig_top = getattr(cls, "get_top_tokens", None)
+
+    def get_top_tokens(self, hidden_states):
+        lm = self.lm_head
+        if getattr(lm, "exl3_draft_trellis", None) is None or orig_top is None:
+            return orig_top(self, hidden_states)
+        from . import ops  # noqa: F401
+        sub = torch.ops.exl3rocm.linear(hidden_states, lm.exl3_draft_trellis, lm.exl3_suh_0, lm.exl3_draft_svh,
+                                        lm.exl3_K[0], lm.exl3_is_mcg, lm.exl3_is_mul1)
+        vocab = self.config.vocab_size
+        cols = lm.exl3_draft_cols
+        sub = sub.masked_fill((cols >= vocab)[None, :], float("-inf"))
+        return cols[sub.argmax(dim=-1)]
+
+    if orig_top is not None:
+        cls.get_top_tokens = get_top_tokens
+    cls._exl3_patched = True
+
+
 def _install_debug_graph_timing():
     """EXL3_DEBUG_GRAPH_TIME=N: time every CUDA/HIP graph replay with GPU events and log the
     median replay time and the median interval between replay starts every N replays."""
@@ -392,6 +477,8 @@ def register():
     from . import ops  # noqa: F401  (registers torch.ops.exl3rocm.linear)
     if os.environ.get("EXL3_FP8_EMBEDDING", "1") != "0":
         _install_fp8_embedding_hook()
+    if os.environ.get("EXL3_DRAFT_VOCAB_BLOCKS", "640") != "0":
+        _install_draft_logits_patch()
     if os.environ.get("EXL3_DEBUG_MODULE_SYNC") == "1":
         _install_debug_module_sync()
     return None

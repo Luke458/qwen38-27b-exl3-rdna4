@@ -29,6 +29,7 @@ exec podman run --rm --name vllm-exl3 \
   $GDN_MOUNT ${EXTRA_MOUNTS:-} \
   -e PYTHONPATH=/exl3ext -e GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-1} \
   -e VLLM_USE_V2_MODEL_RUNNER=${EXL3_V2_RUNNER:-1} \
+  -e EXL3_GEMV_FUSED_HAD=${EXL3_GEMV_FUSED_HAD:-1} \
   --entrypoint bash "$IMAGE" -c "
     cp -r /plugin /tmp/plugin && pip install --no-deps --no-build-isolation -q /tmp/plugin >/dev/null &&
     exec vllm serve /model --served-model-name '$NAME' --host 0.0.0.0 --port 8000 \
