@@ -17,7 +17,7 @@ weights. This project's MIT license does not replace model or dependency terms.
 `vllm_plugin/exl3rocm/plugin.py` adapts the vLLM quantization-plugin structure of
 [0xSero/exl3xpu](https://github.com/0xSero/exl3xpu) (commit 6872a30): checkpoint-driven
 EXL3 module discovery, fused-module shard handling with per-shard input scales, and the
-plugin entry point. `experiments/0016-vllm-base/patches/gdn_attn_mask_sync.patch` ports
+plugin entry point. `vllm_plugin/patches/vllm-0.28.0-rdna4/gdn_attn_mask_sync.patch` ports
 its GDN metadata mask-index fix. License text:
 
 ```
@@ -43,3 +43,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## vLLM (Apache-2.0)
+
+`vllm_plugin/patches/vllm-0.28.0-rdna4/gdn_attn.py` is a modified copy of
+`vllm/v1/attention/backends/gdn_attn.py` from vLLM 0.28.0 (as shipped in the
+`capicua25x/vllm-rocm-rdna4:0.28.0-rdna4` image), copyright contributors to the vLLM
+project, licensed under the Apache License 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). The changes are the GDN metadata
+mask-index fix and one metadata build per step shared across GDN layers; the
+`.patch` files next to it show the exact differences. The plugin otherwise only
+imports vLLM at runtime and does not redistribute it.

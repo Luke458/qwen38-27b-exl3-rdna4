@@ -15,6 +15,15 @@ measured **1.0416× decode throughput** in ten paired trials, below the predecla
 experiment was slower and stays disabled. See [measured status](docs/STATUS.md)
 and [next optimisation work](docs/OPTIMIZATION.md).
 
+## vLLM plugin (fast path)
+
+[`vllm_plugin/`](vllm_plugin/README.md) serves the same checkpoint through vLLM 0.28
+(community rdna4 image, podman) with EXL3 kernels from the fork: **~80 tok/s single
+stream with native MTP-3**, ~200 tok/s aggregate at 8 streams, int8 KV cache, up to
+64k context, plus vision, reasoning and tool-call parsing, all within 16 GB. It is experimental and has been
+tested only on this card and checkpoint. See [the port assessment](docs/VLLM_PORT_ASSESSMENT.md)
+and [the decode trace](docs/DECODE_TRACE.md).
+
 ## Quickstart
 
 Prerequisites: Linux with a working ROCm **7.2.4** installation at `/opt/rocm`,
