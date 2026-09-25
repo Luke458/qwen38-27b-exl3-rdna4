@@ -13,8 +13,13 @@ MODEL_DIR=$(realpath "$1"); NAME=$2; shift 2
 IMAGE=docker.io/capicua25x/vllm-rocm-rdna4:0.28.0-rdna4
 mkdir -p "$HOME/.cache/vllm-rdna4-exl3"
 ARGS=$(printf ' %q' "$@")
+# forward every EXL3_* tuning/debug variable into the container
+ENV_FWD=""
+for v in $(compgen -e | grep '^EXL3_' | grep -v '^EXL3_EXT_DIR$'); do ENV_FWD="$ENV_FWD -e $v"; done
 # EXL3_TEXT_ONLY=1 skips the vision tower (saves ~0.6 GiB for KV cache)
-MM_ARGS=""
+# images are capped at 1 MP by default: an uncapped 2560x1920 image pushed peak VRAM to within
+# 104 MiB of the 16 GB card (experiments/0022); later --mm-processor-kwargs arguments override it
+MM_ARGS="--mm-processor-kwargs '{\"max_pixels\":${EXL3_MAX_PIXELS:-1048576}}'"
 if [ "${EXL3_TEXT_ONLY:-0}" = "1" ]; then MM_ARGS="--limit-mm-per-prompt '{\"image\":0,\"video\":0}'"; fi
 # vLLM 0.28 GDN metadata patch: one build per step instead of one per GDN layer (+20% MTP)
 GDN_MOUNT=""
@@ -29,7 +34,7 @@ exec podman run --rm --name vllm-exl3 \
   -v "$HERE":/plugin:ro \
   -v "$(realpath "$EXL3_EXT_DIR")":/exl3ext:ro \
   -v "$HOME/.cache/vllm-rdna4-exl3":/root/.cache/vllm \
-  $GDN_MOUNT ${EXTRA_MOUNTS:-} \
+  $GDN_MOUNT ${EXTRA_MOUNTS:-} $ENV_FWD \
   -e PYTHONPATH=/exl3ext -e GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-1} \
   -e VLLM_USE_V2_MODEL_RUNNER=${EXL3_V2_RUNNER:-1} \
   -e EXL3_GEMV_FUSED_HAD=${EXL3_GEMV_FUSED_HAD:-1} \

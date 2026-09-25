@@ -40,6 +40,7 @@ FUSED = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
     "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    "qkv": ["q_proj", "k_proj", "v_proj"],          # vision attention (language uses qkv_proj)
 }
 QKV_IDS = {"q": 0, "k": 1, "v": 2}
 
@@ -132,10 +133,11 @@ class Exl3Config(QuantizationConfig):
     def _groups_for(self, prefix: str):
         """Checkpoint members of the (possibly fused) vLLM module at `prefix`, as
         [(member_key, K, k, n)], or None when the module is not EXL3 (e.g. in_proj_ba)."""
-        # vision tower: attn.qkv has no EXL3 member of that name (the checkpoint's bf16 fused
-        # qkv.weight is used unquantized; the 6-bit q/k/v copies are filtered at load), so it
-        # falls through to None below; proj / linear_fc1 / linear_fc2 / merger are EXL3.
+        # vision tower: proj / linear_fc1 / linear_fc2 / merger are EXL3; attn.qkv is the 6-bit
+        # q/k/v groups (FUSED "qkv"), or unquantized bf16 with EXL3_VISION_QKV_BF16=1.
         key = _norm_key(prefix)
+        if key.endswith(".attn.qkv") and key.startswith("visual.") and os.environ.get("EXL3_VISION_QKV_BF16") == "1":
+            return None
         base, _, leaf = key.rpartition(".")
         members = [f"{base}.{p}" if base else p for p in FUSED.get(leaf, [leaf])]
         found = [self.modules.get(m) for m in members]
@@ -145,6 +147,9 @@ class Exl3Config(QuantizationConfig):
         return [(m, *f) for m, f in zip(members, found)]
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if _BUILDING_DRAFTER["on"] and isinstance(layer, VocabParallelEmbedding) \
+                and os.environ.get("EXL3_DRAFTER_PLACEHOLDERS", "1") != "0":
+            return SharedPlaceholderMethod()     # embed_tokens and lm_head: vLLM shares the target's
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             groups = self._groups_for(prefix)
             if groups is None:
@@ -153,6 +158,58 @@ class Exl3Config(QuantizationConfig):
         if isinstance(layer, VocabParallelEmbedding) and self.fp8_embedding and prefix.endswith("embed_tokens"):
             return Fp8EmbeddingMethod()
         return None
+
+
+class SharedPlaceholderMethod(QuantizeMethodBase):
+    """For the MTP drafter's own embed_tokens / lm_head. vLLM (V1 and V2 runners) always replaces
+    both with the target's modules after loading a Qwen3.5 MTP drafter (it declares neither
+    has_own_embed_tokens nor has_own_lm_head), so allocating and loading them only fragments
+    memory (~2 GiB transient here: 1.18 GiB fp8 embedding, 0.64 GiB lm_head, 0.21 GiB draft head).
+    Registers a 0-size weight whose loader discards the checkpoint tensor; any use raises."""
+
+    def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size,
+                       output_size, params_dtype, **extra_weight_attrs):
+        # the names the checkpoint provides: EXL3 lm_head tensors, or a plain embedding weight
+        names = ("trellis", "suh", "svh", "mul1") if isinstance(layer, ParallelLMHead) else ("weight",)
+        for name in names:
+            w = Parameter(torch.empty(0, dtype=torch.float16), requires_grad=False)
+            w.weight_loader = lambda *a, **kw: None
+            layer.register_parameter(name, w)
+        layer.exl3_placeholder = True
+
+    def process_weights_after_loading(self, layer):
+        pass
+
+    def apply(self, layer, x, bias=None):
+        raise RuntimeError("exl3rocm: MTP drafter lm_head placeholder used; vLLM did not share the target's")
+
+    def embedding(self, layer, input_):
+        raise RuntimeError("exl3rocm: MTP drafter embedding placeholder used; vLLM did not share the target's")
+
+
+_BUILDING_DRAFTER = {"on": False}
+
+
+def _install_drafter_placeholder_hook():
+    try:
+        from vllm.model_executor.models import qwen3_5_mtp
+    except Exception:
+        return
+    for name in ("Qwen3_5MTP", "Qwen3_5MoeMTP"):
+        cls = getattr(qwen3_5_mtp, name, None)
+        if cls is None or getattr(cls, "_exl3_placeholder_hook", False):
+            continue
+        orig = cls.__init__
+
+        def __init__(self, *a, orig=orig, **kw):
+            _BUILDING_DRAFTER["on"] = True
+            try:
+                orig(self, *a, **kw)
+            finally:
+                _BUILDING_DRAFTER["on"] = False
+
+        cls.__init__ = __init__
+        cls._exl3_placeholder_hook = True
 
 
 class Fp8EmbeddingMethod(QuantizeMethodBase):
@@ -254,6 +311,8 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def _loader(self, layer, kind):
         def load(param, w, shard_id=None, *args, **kwargs):
+            if shard_id is None:
+                shard_id = getattr(w, "exl3_shard", None)
             g = self._group_of(layer, shard_id)
             if kind in ("mul1", "mcg"):
                 val = int(w.item())
@@ -443,13 +502,32 @@ def _install_draft_logits_patch():
     cls._exl3_patched = True
 
 
-_VISUAL_QKV_DUP = re.compile(r"(^|\.)visual\.blocks\.\d+\.attn\.[qkv]_proj\.")
+_VISUAL_QKV_SPLIT = re.compile(r"^(.*\bvisual\.blocks\.\d+\.attn\.)([qkv])_proj\.(trellis|suh|svh|mul1|bias)$")
+_VISUAL_QKV_FUSED_W = re.compile(r"\bvisual\.blocks\.\d+\.attn\.qkv\.weight$")
+
+
+def _visual_qkv_stream(weights):
+    """The checkpoint stores each vision attention's q/k/v twice: 6-bit EXL3 q_proj/k_proj/v_proj
+    and a bf16 fused qkv.weight (+ bf16 fused qkv.bias). EXL3 mode (default, what exllamav3 runs,
+    ~134 MB less VRAM): rename q/k/v EXL3 tensors onto attn.qkv with their shard as a tensor
+    attribute and drop the bf16 weight; the per-matrix fp16 biases are dropped in favour of the
+    fused bias. EXL3_VISION_QKV_BF16=1: keep the bf16 fused weight, drop the EXL3 copies."""
+    bf16 = os.environ.get("EXL3_VISION_QKV_BF16") == "1"
+    for n, w in weights:
+        m = _VISUAL_QKV_SPLIT.search(n)
+        if m:
+            if bf16 or m.group(3) == "bias":
+                continue
+            w.exl3_shard = m.group(2)
+            yield m.group(1) + "qkv." + m.group(3), w
+        elif not bf16 and _VISUAL_QKV_FUSED_W.search(n):
+            continue
+        else:
+            yield n, w
 
 
 def _install_visual_qkv_filter():
-    """The checkpoint stores each vision attention's q/k/v twice: 6-bit EXL3 q_proj/k_proj/v_proj
-    and a bf16 fused qkv.weight. vLLM's vision attention is a fused QKV linear, so load the bf16
-    tensor and drop the EXL3 duplicates (they have no parameter to load into)."""
+    """Route the vision q/k/v tensors (see _visual_qkv_stream)."""
     try:
         from vllm.model_executor.models import qwen3_5
     except Exception:
@@ -461,11 +539,63 @@ def _install_visual_qkv_filter():
         orig = cls.load_weights
 
         def load_weights(self, weights, orig=orig):
-            loaded = orig(self, ((n, w) for n, w in weights if not _VISUAL_QKV_DUP.search(n)))
-            return loaded
+            return orig(self, _visual_qkv_stream(weights))
 
         cls.load_weights = load_weights
         cls._exl3_visual_filter = True
+
+
+def _install_pth_prefill_dequant():
+    """Per-token-head int8/fp8 KV cache: the Triton unified attention kernel dequantizes K/V
+    inline per query tile, which is cheap for decode but halves long-prompt prefill speed (every
+    query tile of a 2048-token chunk re-converts the whole context). For long queries, gather the
+    batch's blocks once, dequantize to fp16 (value * its per-token-head scale), and run the fp16
+    path on a remapped block table. Decode / MTP verify (short queries, graph-captured) keep the
+    inline path. Same idea as exl3xpu's fp8-KV prefill fix."""
+    try:
+        from vllm.v1.attention.backends import triton_attn as ta
+        from vllm.v1.kv_cache_interface import KVQuantMode
+    except Exception:
+        return
+    if getattr(ta, "_exl3_pth_prefill", False):
+        return
+    orig = ta.unified_attention
+    thr = int(os.environ.get("EXL3_PTH_PREFILL_MIN_Q", "32"))
+    # the fp16 K+V copy is transient and grows with context (~268 MB at 64k tokens). The inline
+    # fallback is ~4.5x slower at 38k context (experiments/0022), so the default is no limit and
+    # KV sizing leaves room for the copy; EXL3_PTH_PREFILL_MAX_MB caps it if memory is tighter.
+    budget = int(float(os.environ.get("EXL3_PTH_PREFILL_MAX_MB", "1e9")) * 1048576)
+    modes = (KVQuantMode.INT8_PER_TOKEN_HEAD, KVQuantMode.FP8_PER_TOKEN_HEAD)
+    ones = {}
+
+    def unified_attention(*args, **kw):
+        mode = kw.get("kv_quant_mode", KVQuantMode.NONE)
+        if args or mode not in modes or kw.get("max_seqlen_q", 0) < thr \
+                or torch.cuda.is_current_stream_capturing():
+            return orig(*args, **kw)
+        q, k, v, bt = kw["q"], kw["k"], kw["v"], kw["block_table"]
+        ks, vs = kw["k_scale_cache"], kw["v_scale_cache"]
+        hs = q.shape[-1]
+        bsz = k.shape[1]
+        nb = (int(kw["max_seqlen_k"]) + bsz - 1) // bsz
+        if bt.shape[0] * nb * bsz * k.shape[2] * hs * 2 * q.element_size() > budget:
+            return orig(*args, **kw)
+        used = bt[:, :nb]
+        flat = used.reshape(-1)
+        from .kv_dequant import gather_dequant
+        kd = gather_dequant(k, ks, flat, hs, q.dtype, "k")
+        vd = gather_dequant(v, vs, flat, hs, q.dtype, "v")
+        key = (q.device, kd.shape[2])
+        if key not in ones:
+            ones[key] = torch.ones((1, 1), dtype=torch.float32, device=q.device)
+        desc = ones[key].expand(bt.shape[0], kd.shape[2])
+        kw = dict(kw, k=kd, v=vd, kv_quant_mode=KVQuantMode.NONE, k_scale_cache=None, v_scale_cache=None,
+                  k_descale=desc, v_descale=desc,
+                  block_table=torch.arange(flat.numel(), device=bt.device, dtype=bt.dtype).view(used.shape))
+        return orig(**kw)
+
+    ta.unified_attention = unified_attention
+    ta._exl3_pth_prefill = True
 
 
 def _install_debug_graph_timing():
@@ -516,6 +646,9 @@ def register():
     _install_visual_qkv_filter()
     if os.environ.get("EXL3_DRAFT_VOCAB_BLOCKS", "640") != "0":
         _install_draft_logits_patch()
+    _install_drafter_placeholder_hook()
+    if os.environ.get("EXL3_PTH_PREFILL_DEQUANT", "1") != "0":
+        _install_pth_prefill_dequant()
     if os.environ.get("EXL3_DEBUG_MODULE_SYNC") == "1":
         _install_debug_module_sync()
     return None

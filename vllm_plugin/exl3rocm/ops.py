@@ -19,7 +19,9 @@ import torch
 
 _ext = None
 GEMM_MAX_ROWS = int(os.environ.get("EXL3_GEMM_MAX_ROWS", "1"))
-RECON_SLICE_N = int(os.environ.get("EXL3_RECON_SLICE_N", "32768"))
+# widest non-lm_head layer (17408): no extra slicing for model layers, and the shared
+# reconstruction buffer is 178 MB instead of 335 MB (lm_head slices at 17408)
+RECON_SLICE_N = int(os.environ.get("EXL3_RECON_SLICE_N", "17408"))
 # rows 2..MR_MAX use the multi-row GEMV when the extension has it (patch 0002)
 MR_MAX = int(os.environ.get("EXL3_MR_MAX", "16"))
 
@@ -27,6 +29,10 @@ MR_MAX = int(os.environ.get("EXL3_MR_MAX", "16"))
 def _has_mr(E):
     return hasattr(E, "exl3_gemv_mr")
 
+
+# EXL3_DEBUG_MEM=N: log torch allocator stats every N embedding calls (eager steps only)
+_DEBUG_MEM = int(os.environ.get("EXL3_DEBUG_MEM", "0"))
+_DEBUG_MEM_STATE = {"n": 0}
 
 # timing-only debug switch: quantized linears return zeros without running kernels
 _DEBUG_SKIP = os.environ.get("EXL3_DEBUG_SKIP_LINEAR") == "1"
@@ -179,6 +185,13 @@ def fp8_embedding(weight: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     """Row gather from a float8_e4m3fn table, cast to fp16. Opaque on purpose: Inductor
     lowered the inline view/index/cast by materializing a full 1.19 GiB copy of the table
     (OOM when the MTP drafter compiled; experiments/0019)."""
+    if _DEBUG_MEM:
+        _DEBUG_MEM_STATE["n"] += 1
+        if _DEBUG_MEM_STATE["n"] % _DEBUG_MEM == 0 and not torch.cuda.is_current_stream_capturing():
+            import sys
+            print(f"[exl3mem] step {_DEBUG_MEM_STATE['n']} tokens {ids.numel()} alloc "
+                  f"{torch.cuda.memory_allocated() >> 20} MiB reserved {torch.cuda.memory_reserved() >> 20} MiB "
+                  f"max_alloc {torch.cuda.max_memory_allocated() >> 20} MiB", file=sys.stderr, flush=True)
     flat = ids.reshape(-1)
     rows = weight.view(torch.uint8).index_select(0, flat)
     return rows.view(torch.float8_e4m3fn).to(torch.float16).view(*ids.shape, weight.shape[1])

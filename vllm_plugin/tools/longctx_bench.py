@@ -13,8 +13,9 @@ import urllib.request
 
 def corpus():
     parts = []
-    for pat in ("docs/*.md", "README.md", "vendor/rocm_exl3/README.md", "vendor/rocm_exl3/exllamav3/modules/*.py"):
-        for f in sorted(glob.glob(pat)):
+    for pat in ("docs/*.md", "README.md", "vendor/rocm_exl3/README.md", "vendor/rocm_exl3/exllamav3/modules/*.py",
+                "vendor/rocm_exl3/exllamav3/**/*.py"):
+        for f in sorted(glob.glob(pat, recursive=True)):
             parts.append(open(f, errors="ignore").read())
     return "\n\n".join(parts)
 
