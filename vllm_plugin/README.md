@@ -6,8 +6,9 @@ checkpoints on RDNA4, on top of the community
 It reuses the kernels of the pinned ROCm fork in `vendor/rocm_exl3`. The plugin
 structure is adapted from [0xSero/exl3xpu](https://github.com/0xSero/exl3xpu) (MIT).
 
-Status: experimental. Tested only with the GestaltLabs Qwen3.8-27B EXL3 11.5 GB
-checkpoint, one GPU (text, single images, reasoning/tool parsing). See `docs/VLLM_PORT_ASSESSMENT.md` for status and measurements.
+Status: experimental. It has been tested only with the GestaltLabs Qwen3.8-27B EXL3 11.5 GB checkpoint on one GPU
+(text, single images, reasoning and tool-call parsing). Measurements are in
+[`docs/VLLM_PORT_ASSESSMENT.md`](../docs/VLLM_PORT_ASSESSMENT.md) and [`docs/DECODE_TRACE.md`](../docs/DECODE_TRACE.md).
 
 ## Layout
 
@@ -22,21 +23,23 @@ checkpoint, one GPU (text, single images, reasoning/tool parsing). See `docs/VLL
 | `tools/bench_client.py` | single-stream decode benchmark (OpenAI API) |
 | `tools/longctx_bench.py`, `tools/concurrency_bench.py` | long-prompt prefill/decode, concurrent streams |
 | `tools/mem_probe.sh` | start a profile, report KV capacity and peak VRAM under stress |
-| `patches/vllm-0.28.0-rdna4/` | vLLM source patches, mounted over the image (`EXTRA_MOUNTS`) |
+| `patches/exl3-fork/` | kernel patches on the pinned fork (decode GEMV, multi-row verify GEMV, graph-safe fused Hadamard) |
+| `patches/vllm-0.28.0-rdna4/` | vLLM GDN metadata patch, mounted over the image by the launcher |
 | `tests/xcheck_ext.py` | bitwise cross-check of two extension builds |
 | `tests/sweep_op.py` | fault-isolation sweep of the op over every checkpoint shape |
 | `tests/offline_probe.py` | offline load + greedy generation, options as JSON |
 
 ## Quick start
 
+See the [top-level quickstart](../README.md#quickstart-vllm-plugin) for the full commands. In short:
+
 ```bash
-vllm_plugin/tools/build_ext_in_image.sh ~/exl3ext            # ~6 min
-# validate: host control binary writes reference, image build must match bit-for-bit
-EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh /path/to/qwen3.8-27b-exl3 qwen38-27b-exl3 \
-  --max-model-len 8192 --max-num-seqs 4 --max-num-batched-tokens 512 \
-  --kv-cache-memory-bytes 1500000000
-python3 vllm_plugin/tools/bench_client.py --model qwen38-27b-exl3
+vllm_plugin/tools/build_ext_in_image.sh ~/exl3ext        # fresh pinned fork + patches, built in the image
+EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh <model-dir> qwen38-27b-exl3 <profile flags below>
 ```
+
+`run_exl3_server.sh` binds `127.0.0.1:8000`, installs the plugin into the container at start, and forwards
+every `EXL3_*` environment variable. `tests/xcheck_ext.py` compares two extension builds bit for bit.
 
 ## Serving profiles (RX 9070 XT, Qwen3.8-27B EXL3 11.5 GB, measured 2026-09-25)
 

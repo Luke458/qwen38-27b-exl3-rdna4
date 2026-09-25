@@ -1,31 +1,87 @@
 # Qwen3.8-27B EXL3 on RDNA4
 
-Run a local OpenAI-compatible chat endpoint for **Qwen3.8-27B EXL3 on an AMD
-Radeon RX 9070 XT (gfx1201, 16 GB)**, with reproducible kernel experiments.
+Fast local serving of **Qwen3.8-27B (EXL3, 11.5 GB)** on an **AMD Radeon RX 9070 XT
+(gfx1201, 16 GB)**: an OpenAI-compatible endpoint with speculative decoding, vision,
+reasoning and tool calls, all within 16 GB of VRAM.
 
-This is a narrowly tested research backend, not a general ROCm serving stack.
-The target checkpoint is mixed-bitrate; kernel optimisation focuses on its
-**3-bit `mul1` weights**. No weights or compiled binaries are distributed here.
+The main route is a vLLM plugin ([`vllm_plugin/`](vllm_plugin/README.md)) that runs the
+checkpoint's trellis-quantized weights through custom gfx1201 kernels inside the community
+[vllm-rocm-rdna4](https://github.com/Capicua25x/vllm-rocm-rdna4) image. The repo also keeps
+the original standalone server and the kernel research that led to the plugin.
+No weights or compiled binaries are distributed here.
 
-## Status
+| profile | context | decode | notes |
+|---|---:|---:|---|
+| single user (MTP-3 speculative decoding) | 16k | **~80 tok/s** (code ~99, prose ~80) | vision loaded, 30k KV tokens |
+| multi-user / long context | 64k | 42 tok/s single stream, **~200 tok/s** total at 8 streams | vision loaded, 72k KV tokens |
 
-**Recommended: the vLLM plugin** in [`vllm_plugin/`](vllm_plugin/README.md). It serves this checkpoint
-through vLLM 0.28 (community rdna4 image, podman) with EXL3 kernels from the fork, all within 16 GB:
+Prompt processing runs at about 1.3–1.9k tok/s. The KV cache is int8, and its teacher-forced
+logits match an fp16 KV cache. Measured on 2026-09-25; details are in the
+[plugin README](vllm_plugin/README.md).
 
-- **~80 tok/s single stream** with native MTP-3 speculative decoding (16k context, vision loaded)
-- ~200 tok/s aggregate at 8 streams, or up to 64k context, without MTP
-- int8 KV cache, vision, reasoning and tool-call parsing
+This is an experimental, narrowly tested setup: one card, one checkpoint, one GPU.
 
-It is experimental and has been tested only on this card and checkpoint. See [the port assessment](docs/VLLM_PORT_ASSESSMENT.md)
-and [the decode trace](docs/DECODE_TRACE.md).
+## Quickstart (vLLM plugin)
 
-The original standalone server (`tools/serve.py`, below) still works for single users (about 29 tok/s decode). There, the
-experimental fused/unrolled FP16 implementation measured **1.0416× decode throughput** in ten paired
-trials, below the predeclared 1.05× promotion threshold, so the baseline remains its default. The separate
-int8 experiment was slower and stays disabled. See [measured status](docs/STATUS.md) and
-[next optimisation work](docs/OPTIMIZATION.md).
+Prerequisites: Linux with the amdgpu driver and access to `/dev/kfd` and `/dev/dri`,
+rootless [podman](https://podman.io/), Git, Python 3 and [uv](https://docs.astral.sh/uv/).
+ROCm does not need to be installed on the host because the container brings its own. Allow about
+45 GB of disk: 28 GB for the vLLM image, 12 GB for the model and a few GB for the build.
 
-## Quickstart (standalone server)
+```bash
+git clone https://github.com/Luke458/qwen38-27b-exl3-rdna4.git
+cd qwen38-27b-exl3-rdna4
+
+# 1. build the kernel extension inside the vLLM image (~6 min; pulls the image on first use)
+vllm_plugin/tools/build_ext_in_image.sh ~/exl3ext
+
+# 2. download the tested checkpoint
+uvx --from huggingface_hub hf download GestaltLabs/Qwen3.8-27B-EXL3-11.5GB \
+  --revision 0e6c4a863b945dbaf9657343fedd876c45e64dd5 --local-dir ./models/qwen38-27b-exl3
+
+# 3. serve (single-user MTP profile)
+EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh ./models/qwen38-27b-exl3 qwen38-27b-exl3 \
+  --max-model-len 16384 --max-num-seqs 4 --max-num-batched-tokens 2048 \
+  --kv-cache-dtype int8_per_token_head --mamba-ssm-cache-dtype float16 \
+  --kv-cache-memory-bytes 1950000000 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+```
+
+The build prints `source tree matches the tested build` when the fork pin and patches are the ones
+that were measured. The first start compiles and captures graphs for a few minutes, and later starts reuse
+`~/.cache/vllm-rdna4-exl3`. When the log shows `Application startup complete`, the endpoint is
+**`http://127.0.0.1:8000/v1`** with model ID **`qwen38-27b-exl3`** (loopback only, no API key):
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen38-27b-exl3","messages":[{"role":"user","content":"Write a haiku about GPUs."}],
+       "max_tokens":256,"chat_template_kwargs":{"enable_thinking":false}}'
+python3 vllm_plugin/tools/bench_client.py --model qwen38-27b-exl3   # decode tok/s
+```
+
+Thinking is on by default: drop `chat_template_kwargs` and the model thinks first, returning its thoughts
+in the message's `reasoning` field (allow a larger `max_tokens`). OpenAI-style `tools` come back as
+`tool_calls`, and images are accepted as `image_url` content parts (capped at 1 MP).
+
+For the multi-user / 64k profile, replace `--max-model-len`, `--max-num-seqs`, `--kv-cache-memory-bytes`
+and `--speculative-config` with `--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000`.
+`EXL3_TEXT_ONLY=1` skips the vision tower. Stop the server with Ctrl-C or `podman stop vllm-exl3`.
+
+The KV sizes assume a desktop session using ~0.5 GB of VRAM; the measured peak is 15.95 of 16.3 GB. With a busier
+desktop, lower `--kv-cache-memory-bytes`. See the [plugin README](vllm_plugin/README.md) for profiles,
+memory notes and the tools.
+
+## Standalone server (original route)
+
+The original server (`tools/serve.py`) runs the same checkpoint directly on the ROCm fork's
+runtime, without vLLM. It is single-user, has no speculative decoding and decodes at about 29 tok/s.
+It is kept for reference and for the kernel experiments. In it, the experimental fused/unrolled FP16
+implementation measured **1.0416× decode throughput** in ten paired trials, below the predeclared 1.05×
+promotion threshold, so the baseline remains its default. The separate int8 experiment was slower
+and stays disabled. See [measured status](docs/STATUS.md) and [optimisation notes](docs/OPTIMIZATION.md).
+
+### Quickstart
 
 Prerequisites: Linux with a working ROCm **7.2.4** installation at `/opt/rocm`,
 RX 9070 XT device access, Git, Python 3, and [uv](https://docs.astral.sh/uv/).
@@ -80,7 +136,7 @@ not configured authentication. The compatibility target is
 [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
 not the Responses API. See [serving details](docs/SERVING.md).
 
-### Experimental optimisation profile
+#### Experimental optimisation profile
 
 Use a **separate clone/environment** and run `bash tools/install.sh experimental`
 instead of the default installer. Then launch with:
@@ -114,20 +170,22 @@ summaries are evidence, not portable performance guarantees.
 
 ## Scope and safety
 
-- Linux, Python 3.12, ROCm 7.2.4, PyTorch 2.13.0+rocm7.2, gfx1201.
-- One GPU and one active generation sequence. No MTP/speculative decoding.
-- Multi-row prefill uses reconstruction plus dense multiplication to avoid the
-  fork's unsupported gfx12 WMMA path. Packed single-token decode is retained.
-- Do not force `EXL3_GEMV=0`: that diagnostic path can trap on this GPU.
-- Bind to loopback by default. A local bearer key is not a substitute for TLS,
-  access controls, or a hardened proxy when exposing a server remotely.
-- Chat Completions compatibility is a subset, not the entire OpenAI API;
-  Responses, multimodal input, and tool-call execution are not release targets.
+- Linux and one RX 9070 XT (gfx1201). The plugin uses the `capicua25x/vllm-rocm-rdna4:0.28.0-rdna4`
+  image (vLLM 0.28, ROCm 7.2.3). The standalone server uses Python 3.12, ROCm 7.2.4 and PyTorch 2.13.0+rocm7.2.
+- Both servers bind to loopback. A bearer key is not a substitute for TLS, access controls, or a
+  hardened proxy when exposing a server remotely.
+- Do not set `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` for the plugin, and do not force
+  `EXL3_GEMV=0` in the standalone server. Both caused GPU faults on this card.
+- The standalone server supports one active sequence and a subset of Chat Completions (no
+  multimodal input or tool calls). Multi-row prefill there uses reconstruction plus dense
+  multiplication, which avoids the fork's unsupported gfx12 WMMA path.
 
 ## Upstream and licensing
 
-Based on [CarouselAether/rocm_exl3](https://github.com/CarouselAether/rocm_exl3)
-at a pinned revision, itself a port of
-[ExLlamaV3](https://github.com/turboderp-org/exllamav3).
-See [third-party notices](THIRD_PARTY_NOTICES.md). Model weights are downloaded
-separately and remain subject to their own license.
+MIT-licensed (see [LICENSE](LICENSE)). The kernels build on
+[CarouselAether/rocm_exl3](https://github.com/CarouselAether/rocm_exl3) at a pinned revision,
+itself a port of [ExLlamaV3](https://github.com/turboderp-org/exllamav3). The vLLM plugin's
+structure is adapted from [0xSero/exl3xpu](https://github.com/0xSero/exl3xpu), and it runs on
+[vllm-rocm-rdna4](https://github.com/Capicua25x/vllm-rocm-rdna4). See
+[third-party notices](THIRD_PARTY_NOTICES.md). Model weights are downloaded separately and
+remain subject to their own license.

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "exl3rocm"
 version = "0.1.0"
-description = "vLLM out-of-tree quantization plugin: EXL3 (exllamav3 trellis) weights on ROCm gfx1201"
+description = "vLLM out-of-tree quantization plugin: EXL3 (trellis-quantized) weights on ROCm gfx1201"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 
