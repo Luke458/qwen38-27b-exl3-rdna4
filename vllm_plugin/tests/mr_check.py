@@ -22,7 +22,7 @@ for K, k, n in shapes:
                        generator=g).to(torch.int16)
     suh = (torch.randn(k, device="cuda", generator=g).sign() * 1.03).half()
     svh = (torch.rand(n, device="cuda", generator=g) * 0.02 + 0.005).half()
-    for m in (2, 3, 4, 8):
+    for m in (2, 3, 4, 8, 12, 16):
         x = torch.randn((m, k), device="cuda", dtype=torch.float16, generator=g)
         y = torch.empty((m, n), device="cuda", dtype=torch.float16)
         E.exl3_gemv_mr(x, tr, y, suh, torch.empty_like(x), svh, K, False, True)
@@ -36,7 +36,7 @@ for K, k, n in shapes:
         if not same:
             bad += 1
             print(f"MISMATCH K={K} k={k} n={n} m={m}: max abs {(y.float() - ref.float()).abs().max().item():.3g}")
-print(f"bitwise check: {'PASS' if bad == 0 else f'{bad} FAIL'} ({len(shapes) * 4} cases)", flush=True)
+print(f"bitwise check: {'PASS' if bad == 0 else f'{bad} FAIL'} ({len(shapes) * 6} cases)", flush=True)
 
 # timing, DRAM-resident (rotate copies)
 CASES = [(5120, 17408, 3), (17408, 5120, 3), (5120, 10240, 4), (6144, 5120, 4), (5120, 1024, 5), (5120, 248320, 4)]

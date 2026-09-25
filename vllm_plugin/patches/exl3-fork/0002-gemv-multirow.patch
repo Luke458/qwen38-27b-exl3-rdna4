@@ -32,7 +32,7 @@
 +
 +// Multi-row (1 <= m <= EXL3_GEMV_MR_MAX) EXL3 GEMV, ROCm only (rocm/quant/exl3_gemv_mr_rdna.hip).
 +// Each row's output is bitwise identical to the m == 1 GEMV of that row.
-+#define EXL3_GEMV_MR_MAX 8
++#define EXL3_GEMV_MR_MAX 16
 +
 +bool exl3_gemv_mr_supported(int m, int k, int n, int K, bool mcg, bool mul1);
 +
@@ -67,9 +67,9 @@
 +);
 --- /dev/null
 +++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_mr_rdna.hip
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,370 @@
 +// =============================================================================
-+// Multi-row EXL3 GEMV (2 <= m <= 8) for speculative-decoding verify / small batches
++// Multi-row EXL3 GEMV (2 <= m <= 16) for speculative-decoding verify / small batches
 +// =============================================================================
 +//
 +// Decodes every trellis tile ONCE and applies it to up to MR activation rows. The
@@ -327,7 +327,8 @@
 +{
 +    if (m <= 2)      launch_mr_w<bits, 2>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
 +    else if (m <= 4) launch_mr_w<bits, 4>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
-+    else             launch_mr_w<bits, 8>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
++    else if (m <= 8) launch_mr_w<bits, 8>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
++    else             launch_mr_w<bits, 16>(splitk, warps, n_tiles, groups, g, k, n, m, ldc, stream);
 +}
 +
 +bool exl3_gemv_mr_supported(int m, int k, int n, int K, bool mcg, bool mul1)

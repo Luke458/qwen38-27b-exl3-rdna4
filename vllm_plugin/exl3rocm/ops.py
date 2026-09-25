@@ -21,7 +21,7 @@ _ext = None
 GEMM_MAX_ROWS = int(os.environ.get("EXL3_GEMM_MAX_ROWS", "1"))
 RECON_SLICE_N = int(os.environ.get("EXL3_RECON_SLICE_N", "32768"))
 # rows 2..MR_MAX use the multi-row GEMV when the extension has it (patch 0002)
-MR_MAX = int(os.environ.get("EXL3_MR_MAX", "8"))
+MR_MAX = int(os.environ.get("EXL3_MR_MAX", "16"))
 
 
 def _has_mr(E):
