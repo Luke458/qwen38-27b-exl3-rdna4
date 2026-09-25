@@ -161,8 +161,8 @@ class Fp8EmbeddingMethod(QuantizeMethodBase):
         raise NotImplementedError("exl3rocm: fp8 input embedding cannot be used as an output head")
 
     def embedding(self, layer, input_):
-        rows = layer.weight.view(torch.uint8)[input_]
-        return rows.view(torch.float8_e4m3fn).to(torch.float16)
+        from . import ops  # noqa: F401
+        return torch.ops.exl3rocm.fp8_embedding(layer.weight, input_)
 
 
 class Exl3LinearMethod(LinearMethodBase):

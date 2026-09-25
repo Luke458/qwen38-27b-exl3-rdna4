@@ -1,0 +1,358 @@
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -23,6 +23,9 @@
+ #include "quant/hadamard.cuh"
+ #include "quant/exl3_gemm.cuh"
+ #include "quant/exl3_gemv.cuh"
++#ifdef USE_ROCM
++#include "quant/exl3_gemv_mr.cuh"
++#endif
+ #include "quant/exl3_gemv_int8.cuh"
+ #include "cpu/moe_mul1.h"
+ #include "cpu/moe_handoff.h"
+@@ -151,6 +154,10 @@
+     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
+     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
++#ifdef USE_ROCM
++    m.def("exl3_gemv_mr", &exl3_gemv_mr, "exl3_gemv_mr");
++    m.def("exl3_gemv_mr_supported", &exl3_gemv_mr_supported, "exl3_gemv_mr_supported");
++#endif
+     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
+     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+     m.def("g_get_cc", &g_get_cc, "g_get_cc");
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemv_mr.cuh
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <ATen/Tensor.h>
++
++// Multi-row (1 <= m <= EXL3_GEMV_MR_MAX) EXL3 GEMV, ROCm only (rocm/quant/exl3_gemv_mr_rdna.hip).
++// Each row's output is bitwise identical to the m == 1 GEMV of that row.
++#define EXL3_GEMV_MR_MAX 8
++
++bool exl3_gemv_mr_supported(int m, int k, int n, int K, bool mcg, bool mul1);
++
++void exl3_gemv_mr
++(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    const at::Tensor& suh,
++    at::Tensor& A_had,
++    const at::Tensor& svh,
++    int K,
++    bool mcg,
++    bool mul1
++);
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_mr_rdna.hip
+@@ -0,0 +1,307 @@
++// =============================================================================
++// Multi-row EXL3 GEMV (2 <= m <= 8) for speculative-decoding verify / small batches
++// =============================================================================
++//
++// Decodes every trellis tile ONCE and applies it to up to MR activation rows. The
++// per-weight cost of this kernel family is the trellis decode (ALU), not the multiply,
++// so m rows cost little more than one.
++//
++// Bit-exactness contract: every row's output is bitwise identical to what the m == 1
++// GEMV (exl3_gemv_rdna.hip, barrier-free direct core) produces for that row alone:
++//   - same split-K decision (exl3_gemv_splitk_enabled && n_tiles <= MAX_TILES) and the
++//     same split-K wave count (exl3_gemv_splitk_warps(k_tiles, n_tiles, 1)), so every
++//     warp covers the same k16 range;
++//   - same per-tile arithmetic: dq_dispatch, then the four fdot2 in the same order into
++//     the same two fp32 accumulators, the same xor-quad reduction and remap;
++//   - same in-block split-K reduction order (w = 0..W-1) and the same __float2half store;
++//   - input / output Hadamards run the same had_hf_r_128_inner per 128-element chunk.
++// mul1 codebook, fp16 output only (the vLLM plugin's contract). Other shapes decline.
++
++#include <cuda_fp16.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <ATen/cuda/CUDAContext.h>
++#include "../../util.h"
++#include "../../util.cuh"
++#include "exl3_gemv_kernel_rdna.hip.h"
++#include "../../quant/exl3_gemv_mr.cuh"
++
++bool exl3_gemv_splitk_enabled();
++int exl3_gemv_splitk_warps(int k_tiles, int n_tiles, int bszm);
++
++// -----------------------------------------------------------------------------
++// Direct core, MR rows. Mirrors exl3_gemv_dot_tile_direct (0018 form) exactly per row.
++// -----------------------------------------------------------------------------
++template <int bits, int cb, int MR>
++__device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
++(
++    const half* __restrict__ A,        // rotated input rows, [m][size_k]
++    const uint16_t* __restrict__ B,
++    const int n_tiles,
++    const int tile_n,
++    const int lane,
++    const int kb_begin,
++    const int kb_end,
++    const int m,
++    const int size_k,
++    float (&out)[MR]                   // lane l (0-15): column l of each row
++)
++{
++    constexpr int tile_elements = 16 * bits;
++    const int r0 = (lane & 3) * 2;
++
++    float accA[MR], accB[MR];
++    #pragma unroll
++    for (int r = 0; r < MR; ++r) { accA[r] = 0.0f; accB[r] = 0.0f; }
++
++    Exl3BufWords bw { exl3_make_rsrc(B), 0u };
++    const __amdgpu_buffer_rsrc_t a_rsrc = exl3_make_rsrc(A);
++    const uint32_t a_lane01 = ((uint32_t) r0 >> 1) * 4u;
++    const uint32_t a_lane89 = (((uint32_t) r0 >> 1) + 4u) * 4u;
++    const uint32_t tile_bytes = (uint32_t) tile_elements * 2u;
++    const uint32_t row_bytes = (uint32_t) size_k * 2u;
++
++    #pragma unroll 2
++    for (int k_tile = kb_begin; k_tile < kb_end; k_tile++)
++    {
++        bw.soff = ((uint32_t) k_tile * (uint32_t) n_tiles + (uint32_t) tile_n) * tile_bytes;
++
++        FragB frag0, frag1;
++        dq_dispatch<bits, cb>(bw, lane << 3, frag0, frag1);
++
++        #pragma unroll
++        for (int r = 0; r < MR; ++r)
++        {
++            // rows >= m read row 0 (valid memory) and are never stored
++            const uint32_t a_soff = (uint32_t) k_tile * 32u + (uint32_t) (r < m ? r : 0) * row_bytes;
++            half2_uint32 a01u(__builtin_amdgcn_raw_buffer_load_b32(a_rsrc, a_lane01, a_soff, 0));
++            half2_uint32 a89u(__builtin_amdgcn_raw_buffer_load_b32(a_rsrc, a_lane89, a_soff, 0));
++            accA[r] = __builtin_amdgcn_fdot2(a01u.as_half2, frag0[0], accA[r], false);
++            accA[r] = __builtin_amdgcn_fdot2(a89u.as_half2, frag0[1], accA[r], false);
++            accB[r] = __builtin_amdgcn_fdot2(a01u.as_half2, frag1[0], accB[r], false);
++            accB[r] = __builtin_amdgcn_fdot2(a89u.as_half2, frag1[1], accB[r], false);
++        }
++    }
++
++    #pragma unroll
++    for (int r = 0; r < MR; ++r)
++    {
++        float a = accA[r], b = accB[r];
++        a += __shfl_xor(a, 1, 32);
++        a += __shfl_xor(a, 2, 32);
++        b += __shfl_xor(b, 1, 32);
++        b += __shfl_xor(b, 2, 32);
++        float vA = __shfl(a, (lane & 7) * 4, 32);
++        float vB = __shfl(b, (lane & 7) * 4, 32);
++        out[r] = (lane & 8) ? vB : vA;
++    }
++}
++
++// Split-K form: one block per n-tile, WARPS warps share the k range (== m1 splitk kernel)
++template <int bits, int cb, int WARPS, int MR>
++__global__ __launch_bounds__(WARPS * 32)
++void exl3_gemv_mr_splitk_kernel
++(
++    const half* __restrict__ A,
++    const uint16_t* __restrict__ B,
++    half* __restrict__ C,
++    const int size_k,
++    const int size_n,
++    const int m,
++    const int ldc                      // output row stride (elements)
++)
++{
++    const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
++    const int lane = threadIdx.x % 32;
++    const int tile_n = blockIdx.x;
++    const int n_tiles = size_n / 16;
++
++    __shared__ float sh_red[WARPS * 16 * MR];
++
++    const int num_k_tiles = size_k / 16;
++    const int chunk = (num_k_tiles + WARPS - 1) / WARPS;
++    const int kb0 = warp_id * chunk;
++    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
++
++    float acc[MR];
++    #pragma unroll
++    for (int r = 0; r < MR; ++r) acc[r] = 0.0f;
++    if (kb0 < kb1)
++        exl3_gemv_dot_tile_direct_mr<bits, cb, MR>(A, B, n_tiles, tile_n, lane, kb0, kb1, m, size_k, acc);
++
++    if (lane < 16)
++    {
++        #pragma unroll
++        for (int r = 0; r < MR; ++r) sh_red[(r * WARPS + warp_id) * 16 + lane] = acc[r];
++    }
++    __syncthreads();
++
++    // warp w reduces rows w, w + WARPS, ... (each in the m1 kernel's w = 0..WARPS-1 order)
++    if (lane < 16)
++    {
++        for (int r = warp_id; r < m && r < MR; r += WARPS)
++        {
++            float total = 0.0f;
++            #pragma unroll
++            for (int w = 0; w < WARPS; ++w) total += sh_red[(r * WARPS + w) * 16 + lane];
++            C[(size_t) r * ldc + tile_n * 16 + lane] = __float2half(total);
++        }
++    }
++}
++
++// Whole-k form: each warp owns one n-tile over the full k range (== m1 exl3_gemv_dot_kernel)
++template <int bits, int cb, int WARPS, int MR>
++__global__ __launch_bounds__(WARPS * 32)
++void exl3_gemv_mr_kernel
++(
++    const half* __restrict__ A,
++    const uint16_t* __restrict__ B,
++    half* __restrict__ C,
++    const int size_k,
++    const int size_n,
++    const int m,
++    const int ldc                      // output row stride (elements)
++)
++{
++    const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
++    const int lane = threadIdx.x % 32;
++    const int tile_n = blockIdx.x * WARPS + warp_id;
++    const int n_tiles = size_n / 16;
++    if (tile_n >= n_tiles) return;
++
++    float acc[MR];
++    exl3_gemv_dot_tile_direct_mr<bits, cb, MR>(A, B, n_tiles, tile_n, lane, 0, size_k / 16, m, size_k, acc);
++    if (lane < 16)
++    {
++        #pragma unroll
++        for (int r = 0; r < MR; ++r)
++            if (r < m) C[(size_t) r * ldc + tile_n * 16 + lane] = __float2half(acc[r]);
++    }
++}
++
++// Hadamards over [m][size] as independent 128-chunks; scale index wraps per row
++static __global__ __launch_bounds__(256)
++void exl3_gemv_mr_had_in_kernel(const half* __restrict__ in, half* __restrict__ out,
++                                const half* __restrict__ scales, const int size, const int total)
++{
++    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
++    if (warp < total / 128)
++    {
++        int off = warp * 128;
++        had_hf_r_128_inner<true, false>(in + off, out + off, scales + off % size, 0.088388347648f);
++    }
++}
++
++static __global__ __launch_bounds__(256)
++void exl3_gemv_mr_had_out_kernel(const half* __restrict__ in, half* __restrict__ out,
++                                 const half* __restrict__ scales, const int size, const int total,
++                                 const int ldc)
++{
++    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
++    if (warp < total / 128)
++    {
++        int off = warp * 128;
++        int row = off / size, col = off % size;
++        size_t p = (size_t) row * ldc + col;
++        had_hf_r_128_inner<false, true>(in + p, out + p, scales + col, 0.088388347648f);
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Host
++// -----------------------------------------------------------------------------
++template <int bits, int WARPS, int MR>
++static void launch_mr(bool splitk, int n_tiles, const half* A, const uint16_t* B, half* C,
++                      int k, int n, int m, int ldc, cudaStream_t stream)
++{
++    if (splitk)
++        hipLaunchKernelGGL((exl3_gemv_mr_splitk_kernel<bits, 2, WARPS, MR>), dim3(n_tiles), dim3(WARPS * 32),
++                           0, stream, A, B, C, k, n, m, ldc);
++    else
++        hipLaunchKernelGGL((exl3_gemv_mr_kernel<bits, 2, 4, MR>), dim3((n_tiles + 3) / 4), dim3(4 * 32),
++                           0, stream, A, B, C, k, n, m, ldc);
++}
++
++template <int bits, int MR>
++static void launch_mr_w(bool splitk, int warps, int n_tiles, const half* A, const uint16_t* B, half* C,
++                        int k, int n, int m, int ldc, cudaStream_t stream)
++{
++    switch (warps)
++    {
++        case 4:  launch_mr<bits, 4, MR>(splitk, n_tiles, A, B, C, k, n, m, ldc, stream); break;
++        case 8:  launch_mr<bits, 8, MR>(splitk, n_tiles, A, B, C, k, n, m, ldc, stream); break;
++        default: launch_mr<bits, 16, MR>(splitk, n_tiles, A, B, C, k, n, m, ldc, stream); break;
++    }
++}
++
++template <int bits>
++static void launch_mr_bits(bool splitk, int warps, int n_tiles, const half* A, const uint16_t* B, half* C,
++                           int k, int n, int m, int ldc, cudaStream_t stream)
++{
++    if (m <= 2)      launch_mr_w<bits, 2>(splitk, warps, n_tiles, A, B, C, k, n, m, ldc, stream);
++    else if (m <= 4) launch_mr_w<bits, 4>(splitk, warps, n_tiles, A, B, C, k, n, m, ldc, stream);
++    else             launch_mr_w<bits, 8>(splitk, warps, n_tiles, A, B, C, k, n, m, ldc, stream);
++}
++
++bool exl3_gemv_mr_supported(int m, int k, int n, int K, bool mcg, bool mul1)
++{
++    return m >= 1 && m <= EXL3_GEMV_MR_MAX && K >= 1 && K <= 8 && mul1 && !mcg
++        && k % 128 == 0 && n % 128 == 0;
++}
++
++void exl3_gemv_mr
++(
++    const at::Tensor& A,       // [m, k] fp16
++    const at::Tensor& B,       // trellis [k/16, n/16, 16K]
++    at::Tensor& C,             // [m, n] fp16, unit column stride, any row stride
++    const at::Tensor& suh,     // [k]
++    at::Tensor& A_had,         // [m, k] scratch
++    const at::Tensor& svh,     // [n]
++    int K,
++    bool mcg,
++    bool mul1
++)
++{
++    const at::cuda::OptionalCUDAGuard device_guard(A.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    const int k = A.size(-1);
++    const int m = A.numel() / k;
++    const int n = C.size(-1);
++    TORCH_CHECK(exl3_gemv_mr_supported(m, k, n, K, mcg, mul1), "exl3_gemv_mr: unsupported call");
++    TORCH_CHECK(A.is_contiguous() && A_had.is_contiguous() && C.stride(-1) == 1, "exl3_gemv_mr: contiguous A, unit-stride C rows");
++    const int ldc = C.dim() >= 2 ? (int) C.stride(-2) : n;
++    TORCH_CHECK(A.scalar_type() == at::kHalf && C.scalar_type() == at::kHalf, "exl3_gemv_mr: fp16 only");
++    TORCH_CHECK(B.size(0) * 16 == k && B.size(1) * 16 == n && B.size(2) == 16 * K, "exl3_gemv_mr: trellis shape");
++
++    const half* A_ptr = (const half*) A.data_ptr();
++    half* Ah_ptr = (half*) A_had.data_ptr();
++    half* C_ptr = (half*) C.data_ptr();
++    const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
++
++    {
++        int warps = m * k / 128;
++        hipLaunchKernelGGL(exl3_gemv_mr_had_in_kernel, dim3((warps + 7) / 8), dim3(256), 0, stream,
++                           A_ptr, Ah_ptr, (const half*) suh.data_ptr(), k, m * k);
++    }
++
++    const int n_tiles = n / 16;
++    const int k_tiles = k / 16;
++    const bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
++    const int warps = splitk ? exl3_gemv_splitk_warps(k_tiles, n_tiles, 1) : 4;
++    switch (K)
++    {
++        case 1: launch_mr_bits<1>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++        case 2: launch_mr_bits<2>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++        case 3: launch_mr_bits<3>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++        case 4: launch_mr_bits<4>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++        case 5: launch_mr_bits<5>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++        case 6: launch_mr_bits<6>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++        case 7: launch_mr_bits<7>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++        default: launch_mr_bits<8>(splitk, warps, n_tiles, Ah_ptr, B_ptr, C_ptr, k, n, m, ldc, stream); break;
++    }
++
++    {
++        int warps_o = m * n / 128;
++        hipLaunchKernelGGL(exl3_gemv_mr_had_out_kernel, dim3((warps_o + 7) / 8), dim3(256), 0, stream,
++                           C_ptr, C_ptr, (const half*) svh.data_ptr(), n, m * n, ldc);
++    }
++}

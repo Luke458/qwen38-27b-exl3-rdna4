@@ -11,6 +11,11 @@ MODEL_DIR=$(realpath "$1"); NAME=$2; shift 2
 IMAGE=docker.io/capicua25x/vllm-rocm-rdna4:0.28.0-rdna4
 mkdir -p "$HOME/.cache/vllm-rdna4-exl3"
 ARGS=$(printf ' %q' "$@")
+# vLLM 0.28 GDN metadata patch: one build per step instead of one per GDN layer (+20% MTP)
+GDN_MOUNT=""
+if [ "${EXL3_GDN_SHARE:-1}" != "0" ]; then
+  GDN_MOUNT="-v $HERE/patches/vllm-0.28.0-rdna4/gdn_attn.py:/build/vllm/vllm/v1/attention/backends/gdn_attn.py:ro"
+fi
 exec podman run --rm --name vllm-exl3 \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --security-opt label=disable --ipc=host \
@@ -19,7 +24,7 @@ exec podman run --rm --name vllm-exl3 \
   -v "$HERE":/plugin:ro \
   -v "$(realpath "$EXL3_EXT_DIR")":/exl3ext:ro \
   -v "$HOME/.cache/vllm-rdna4-exl3":/root/.cache/vllm \
-  ${EXTRA_MOUNTS:-} \
+  $GDN_MOUNT ${EXTRA_MOUNTS:-} \
   -e PYTHONPATH=/exl3ext -e GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-1} \
   --entrypoint bash "$IMAGE" -c "
     cp -r /plugin /tmp/plugin && pip install --no-deps --no-build-isolation -q /tmp/plugin >/dev/null &&
