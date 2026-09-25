@@ -7,7 +7,7 @@ It reuses the exllamav3 ROCm fork's kernels (`vendor/rocm_exl3`). The plugin
 structure is adapted from [0xSero/exl3xpu](https://github.com/0xSero/exl3xpu) (MIT).
 
 Status: experimental. Tested only with the GestaltLabs Qwen3.8-27B EXL3 11.5 GB
-checkpoint, text-only, one GPU. See `docs/VLLM_PORT_ASSESSMENT.md` for status and measurements.
+checkpoint, one GPU (text, single images, reasoning/tool parsing). See `docs/VLLM_PORT_ASSESSMENT.md` for status and measurements.
 
 ## Layout
 
@@ -48,6 +48,13 @@ Common flags: `--max-model-len 16384 --max-num-batched-tokens 2048 --mamba-ssm-c
 Prefill is about 1.4k tok/s (2,048-token chunks; GEMM-bound, `hgemm_recon` ~136 TFLOPS). Decode with MTP stays
 at 84-95 tok/s with 5-9k-token contexts. vLLM 0.28 cannot switch speculation off by batch size
 (`disable_by_batch_size` is not in V1), so there are two profiles.
+
+**Vision, reasoning and tools** (verified 2026-09-25): the vision tower loads by default (EXL3 6-bit
+proj/MLP/merger through the plugin; the checkpoint's bf16 fused `attn.qkv`; MLP built at the EXL3-padded
+width, as exllamav3 does). A synthetic test image (red circle, blue square, "42") was described correctly.
+The vision tower costs ~0.7 GiB, so use `--max-model-len 8192 --kv-cache-memory-bytes 1500000000`
+with MTP, or `EXL3_TEXT_ONLY=1` to skip it. Add `--reasoning-parser qwen3 --enable-auto-tool-choice
+--tool-call-parser qwen3_coder` for separated thinking and OpenAI tool calls (both verified).
 
 Launcher defaults (all measured, see `docs/DECODE_TRACE.md`): `GPU_MAX_HW_QUEUES=1`, the V2 model runner,
 the GDN metadata patch, the fused output Hadamard, and a pruned MTP draft head (`EXL3_DRAFT_VOCAB_BLOCKS=640`).

@@ -49,6 +49,8 @@ def _norm_key(k: str) -> str:
        'model.language_model.layers.3.mlp.gate_proj' / 'language_model.model.layers.3.mlp.gate_proj'
            -> 'layers.3.mlp.gate_proj';  '...mtp.layers.0.x' -> 'mtp.layers.0.x';  '...lm_head' -> 'lm_head'"""
     parts = k.split(".")
+    if "visual" in parts:
+        return "visual." + ".".join(parts[parts.index("visual") + 1:])
     if "mtp" in parts:
         return "mtp." + ".".join(parts[parts.index("mtp") + 1:])
     m = re.search(r"(layers\.\d+\..*)$", k)
@@ -70,7 +72,7 @@ def _read_checkpoint_layout(model_dir: str):
                 continue
             dtypes[name] = v["dtype"]
             shapes[name] = tuple(v["shape"])
-            if name.endswith(".trellis") and "visual" not in name.split("."):
+            if name.endswith(".trellis"):
                 s = v["shape"]
                 out[_norm_key(name[: -len(".trellis")])] = (s[-1] // 16, s[0] * 16, s[1] * 16)
     return out, dtypes, shapes
@@ -115,15 +117,24 @@ class Exl3Config(QuantizationConfig):
                and "visual" not in n.split(".")]
         self.fp8_embedding = len(emb) == 1
         self.embed_shape = shapes[emb[0]] if self.fp8_embedding else None
+        # EXL3 pads linear widths to a multiple of 128 (vision MLP: 4304 -> 4352, with zero-padded
+        # weights and biases); exllamav3 runs the padded width end to end (fc1 out -> fc2 in), so
+        # build vLLM's vision MLP at the stored width too.
+        vc = getattr(hf_config, "vision_config", None) if hf_config is not None else None
+        fc1 = self.modules.get("visual.blocks.0.mlp.linear_fc1")
+        if vc is not None and fc1 is not None and getattr(vc, "intermediate_size", None) not in (None, fc1[2]):
+            logger.info("exl3rocm: vision intermediate_size %d -> %d (EXL3 padded width)",
+                        vc.intermediate_size, fc1[2])
+            vc.intermediate_size = fc1[2]
         logger.info("exl3rocm: %d EXL3 modules (%d in MTP head), fp8 input embedding: %s", len(self.modules),
                     sum(1 for k in self.modules if k.startswith("mtp.")), self.fp8_embedding)
 
     def _groups_for(self, prefix: str):
         """Checkpoint members of the (possibly fused) vLLM module at `prefix`, as
         [(member_key, K, k, n)], or None when the module is not EXL3 (e.g. in_proj_ba)."""
-        parts = prefix.split(".")
-        if "visual" in parts or "vision_tower" in parts:
-            return None
+        # vision tower: attn.qkv has no EXL3 member of that name (the checkpoint's bf16 fused
+        # qkv.weight is used unquantized; the 6-bit q/k/v copies are filtered at load), so it
+        # falls through to None below; proj / linear_fc1 / linear_fc2 / merger are EXL3.
         key = _norm_key(prefix)
         base, _, leaf = key.rpartition(".")
         members = [f"{base}.{p}" if base else p for p in FUSED.get(leaf, [leaf])]
@@ -432,6 +443,31 @@ def _install_draft_logits_patch():
     cls._exl3_patched = True
 
 
+_VISUAL_QKV_DUP = re.compile(r"(^|\.)visual\.blocks\.\d+\.attn\.[qkv]_proj\.")
+
+
+def _install_visual_qkv_filter():
+    """The checkpoint stores each vision attention's q/k/v twice: 6-bit EXL3 q_proj/k_proj/v_proj
+    and a bf16 fused qkv.weight. vLLM's vision attention is a fused QKV linear, so load the bf16
+    tensor and drop the EXL3 duplicates (they have no parameter to load into)."""
+    try:
+        from vllm.model_executor.models import qwen3_5
+    except Exception:
+        return
+    for cls in (getattr(qwen3_5, "Qwen3_5ForConditionalGeneration", None),
+                getattr(qwen3_5, "Qwen3_5MoeForConditionalGeneration", None)):
+        if cls is None or getattr(cls, "_exl3_visual_filter", False):
+            continue
+        orig = cls.load_weights
+
+        def load_weights(self, weights, orig=orig):
+            loaded = orig(self, ((n, w) for n, w in weights if not _VISUAL_QKV_DUP.search(n)))
+            return loaded
+
+        cls.load_weights = load_weights
+        cls._exl3_visual_filter = True
+
+
 def _install_debug_graph_timing():
     """EXL3_DEBUG_GRAPH_TIME=N: time every CUDA/HIP graph replay with GPU events and log the
     median replay time and the median interval between replay starts every N replays."""
@@ -477,6 +513,7 @@ def register():
     from . import ops  # noqa: F401  (registers torch.ops.exl3rocm.linear)
     if os.environ.get("EXL3_FP8_EMBEDDING", "1") != "0":
         _install_fp8_embedding_hook()
+    _install_visual_qkv_filter()
     if os.environ.get("EXL3_DRAFT_VOCAB_BLOCKS", "640") != "0":
         _install_draft_logits_patch()
     if os.environ.get("EXL3_DEBUG_MODULE_SYNC") == "1":
