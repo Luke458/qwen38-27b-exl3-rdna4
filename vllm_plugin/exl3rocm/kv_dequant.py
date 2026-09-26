@@ -61,29 +61,41 @@ def _int4_dequant_kernel(src, scale, blk, out,
                          s_blk, s_slot, s_head,
                          c_blk, c_slot, c_head,
                          o_blk, o_slot, o_head,
-                         mul, HALF: tl.constexpr):
+                         mul, sink_ptr, nkv, nb, HALF: tl.constexpr, SINKS: tl.constexpr):
     """int4_per_token_head: byte i holds elements 2i (low nibble) and 2i+1; the fp32 scale's low 4 mantissa
-    bits are the zero point. out = (nibble - zp) * scale * mul, still in the RHT-rotated domain."""
+    bits are the zero point. out = (nibble - zp) * scale * mul, still in the RHT-rotated domain. The first
+    SINKS slots of each sequence's first block (every nb-th entry) come from the exact fp16 shadow
+    [num_blocks, SINKS, nkv, 2 * HALF] instead."""
     j = tl.program_id(0)
     slot = tl.program_id(1)
     head = tl.program_id(2)
     b = tl.load(blk + j).to(tl.int64)
     d = tl.arange(0, HALF)
+    o = out + j * o_blk + slot * o_slot + head * o_head + 2 * d
+    if SINKS > 0:
+        if (slot < SINKS) & (j % nb == 0):
+            e = sink_ptr + ((b * SINKS + slot) * nkv + head) * (2 * HALF) + 2 * d
+            tl.store(o, (tl.load(e).to(tl.float32) * mul).to(out.dtype.element_ty, fp_downcast_rounding="rtne"))
+            tl.store(o + 1, (tl.load(e + 1).to(tl.float32) * mul).to(out.dtype.element_ty,
+                                                                      fp_downcast_rounding="rtne"))
+            return
     p = tl.load(src + b * s_blk + slot * s_slot + head * s_head + d)
     bits = tl.load(scale + b * c_blk + slot * c_slot + head * c_head).to(tl.int32, bitcast=True)
     zp = (bits & 0xF).to(tl.float32)
     sc = (bits & -16).to(tl.float32, bitcast=True) * mul
     lo = ((p & 0xF).to(tl.float32) - zp) * sc
     hi = (((p >> 4) & 0xF).to(tl.float32) - zp) * sc
-    o = out + j * o_blk + slot * o_slot + head * o_head + 2 * d
     tl.store(o, lo.to(out.dtype.element_ty, fp_downcast_rounding="rtne"))
     tl.store(o + 1, hi.to(out.dtype.element_ty, fp_downcast_rounding="rtne"))
 
 
 def gather_dequant_int4(src: torch.Tensor, scale: torch.Tensor, blocks: torch.Tensor, hs: int,
-                        dtype: torch.dtype, tag: str, cap: int | None = None) -> torch.Tensor:
+                        dtype: torch.dtype, tag: str, cap: int | None = None,
+                        sinks: torch.Tensor | None = None, nb: int = 1) -> torch.Tensor:
     """int4 variant of gather_dequant: src [num_blocks, block_size, nkv, >=hs/2] uint8 view; returns
-    [n, block_size, nkv, hs] in the orthonormal rotated domain (the stored RHT has norm sqrt(hs))."""
+    [n, block_size, nkv, hs] in the orthonormal rotated domain (the stored RHT has norm sqrt(hs)). sinks:
+    the layer's exact fp16 shadow of block-leading slots (kv_int4.exact_buffers), used for each sequence's
+    first positions (blocks lists nb blocks per sequence)."""
     n = blocks.numel()
     _, bsz, nkv, _ = src.shape
     out = _buffer(tag, src.device, n, bsz, nkv, hs, dtype, min(src.shape[0], cap or src.shape[0]))
@@ -93,7 +105,8 @@ def gather_dequant_int4(src: torch.Tensor, scale: torch.Tensor, blocks: torch.Te
         src.stride(0), src.stride(1), src.stride(2),
         scale.stride(0), scale.stride(1), scale.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
-        hs ** -0.5, HALF=hs // 2)
+        hs ** -0.5, sinks if sinks is not None else out, nkv, nb, HALF=hs // 2,
+        SINKS=sinks.shape[1] if sinks is not None else 0)
     return out
 
 

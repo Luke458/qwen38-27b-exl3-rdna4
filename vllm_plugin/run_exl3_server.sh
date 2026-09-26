@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Serve an EXL3 checkpoint with the rdna4 vLLM image + the exl3rocm plugin (rootless podman).
-#   EXL3_EXT_DIR=<dir with container-built exllamav3_ext*.so> \
 #   run_exl3_server.sh <model-dir> <served-name> [extra vllm serve args...]
+# EXL3_EXT_DIR: the container-built exllamav3_ext*.so (default ~/models/exl3ext).
 # Binds 127.0.0.1:8000 only. fp16 activations. Vision on unless EXL3_TEXT_ONLY=1.
 # Defaults (measured, experiments/0019): GPU_MAX_HW_QUEUES=1 (multi-queue cost ~18 ms/step),
 # vLLM V2 model runner (EXL3_V2_RUNNER=0 to disable), GDN metadata patch (EXL3_GDN_SHARE=0).
@@ -9,7 +9,10 @@
 set -euo pipefail
 HERE=$(dirname "$(realpath "$0")")
 MODEL_DIR=$(realpath "$1"); NAME=$2; shift 2
-: "${EXL3_EXT_DIR:?set EXL3_EXT_DIR to the directory holding the container-built exllamav3_ext .so}"
+# container-built kernel extension (vllm_plugin/tools/build_ext_in_image.sh), next to the models by default
+EXL3_EXT_DIR=${EXL3_EXT_DIR:-$HOME/models/exl3ext}
+[ -d "$EXL3_EXT_DIR" ] || { echo "kernel extension not found in $EXL3_EXT_DIR (build it with" \
+  "vllm_plugin/tools/build_ext_in_image.sh $EXL3_EXT_DIR, or set EXL3_EXT_DIR)" >&2; exit 1; }
 IMAGE=docker.io/capicua25x/vllm-rocm-rdna4:0.28.0-rdna4
 # torch.compile's cache key does not cover the multimodal settings: a graph compiled text-only fails when
 # loaded with vision on ("'NoneType' object has no attribute 'size'" in qwen3_next forward), so text-only

@@ -650,6 +650,10 @@ def _install_kv_int4():
     if getattr(ta, "_exl3_kv_int4", False):
         return
     from . import kv_int4
+    try:  # per-layer metadata for the exact tail ring (token positions, batch rows)
+        from vllm.model_executor.layers.attention.attention import get_attention_context
+    except Exception:
+        get_attention_context = None
     int4 = KVQuantMode.INT4_PER_TOKEN_HEAD
     inner = ta.unified_attention
     thr = int(os.environ.get("EXL3_PTH_PREFILL_MIN_Q", "32"))
@@ -676,9 +680,17 @@ def _install_kv_int4():
         if self._kv_quant_mode != int4 or self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return orig_update(self, layer, key, value, kv_cache, slot_mapping)
         key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        name = getattr(layer, "layer_name", None)
+        md = None
+        if name and get_attention_context is not None:
+            try:
+                md = get_attention_context(name)[0]
+            except Exception:
+                md = None
         kv_int4.reshape_and_cache(key, value, key_cache, value_cache, slot_mapping,
                                   k_scale_cache=self._k_scale_cache, v_scale_cache=self._v_scale_cache,
-                                  layer_name=getattr(layer, "layer_name", None))
+                                  layer_name=name, query_start_loc=getattr(md, "query_start_loc", None),
+                                  seq_lens=getattr(md, "seq_lens", None))
 
     def forward(self, layer, *args, **kw):
         cur["layer"] = getattr(layer, "layer_name", None)
@@ -690,6 +702,42 @@ def _install_kv_int4():
     cls.do_kv_cache_update = do_kv_cache_update
     cls.forward = forward
     ta._exl3_kv_int4 = True
+    _install_kv_int4_request_slots(kv_int4)
+
+
+def _install_kv_int4_request_slots(kv_int4):
+    """The int4 exact tail keeps each request's newest positions in a ring indexed by the V2 model runner's
+    request-state slot. Record the slot count, clear a slot's ring tags when a new request takes it, and
+    copy the batch's row -> slot mapping into a persistent buffer before each forward (captured decode
+    graphs read it). Without the V2 runner the tail stays off (sinks still work)."""
+    try:
+        from vllm.v1.worker.gpu import model_runner as mr
+        from vllm.v1.worker.gpu.states import RequestState
+    except Exception:
+        return
+    if getattr(RequestState, "_exl3_slots", False):
+        return
+    orig_init, orig_add = RequestState.__init__, RequestState.add_request
+
+    def __init__(self, *args, **kw):
+        orig_init(self, *args, **kw)
+        kv_int4.configure_request_slots(self.max_num_reqs)
+
+    def add_request(self, req_id, *args, **kw):
+        orig_add(self, req_id, *args, **kw)
+        kv_int4.request_added(self.req_id_to_index[req_id])
+
+    RequestState.__init__ = __init__
+    RequestState.add_request = add_request
+    RequestState._exl3_slots = True
+    orig_prep = mr.GPUModelRunner.prepare_inputs
+
+    def prepare_inputs(self, *args, **kw):
+        batch = orig_prep(self, *args, **kw)
+        kv_int4.set_batch_slots(batch.idx_mapping)
+        return batch
+
+    mr.GPUModelRunner.prepare_inputs = prepare_inputs
 
 
 def _install_debug_graph_timing():

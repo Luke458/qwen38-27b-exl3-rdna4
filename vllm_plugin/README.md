@@ -37,8 +37,8 @@ Status: experimental. It has been tested only with the GestaltLabs Qwen3.8-27B E
 See the [top-level quickstart](../README.md#quickstart-vllm-plugin) for the full commands. In short:
 
 ```bash
-vllm_plugin/tools/build_ext_in_image.sh ~/exl3ext        # fresh pinned fork + patches, built in the image
-EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh <model-dir> qwen38-27b-exl3 <profile flags below>
+vllm_plugin/tools/build_ext_in_image.sh ~/models/exl3ext        # fresh pinned fork + patches, built in the image
+vllm_plugin/run_exl3_server.sh <model-dir> qwen38-27b-exl3 <profile flags below>
 ```
 
 `run_exl3_server.sh` binds `127.0.0.1:8000`, installs the plugin into the container at start, and forwards
@@ -97,16 +97,24 @@ and keeps the cache format:
 - the cache write centers K and V with calibrated per-layer means, which is exact, and picks each row's 4-bit
   range with a small clip search.
 
-Accuracy against an fp16 cache on 2 × 16k tokens of held-out text (prose / code):
+Accuracy against an fp16 cache on 2 × 16k tokens of held-out text (prose / code, 256-token prefill scoring):
 - int4: KL 0.0023 / 0.0027, top-1 98.7%, NLL +0.2%;
 - vLLM's int4: KL 0.0035 / 0.0039;
 - int8: 0.00007.
+
+**Exact rows** (ideas from BeeLlama.cpp's KVarN sinks and KV precision tail). Each sequence's first 4 tokens and
+each request's newest 128 tokens are also kept in fp16 and used in place of their 4-bit rows. The tail is a
+per-request ring keyed by the V2 model runner's request slot, with position tags so MTP rollbacks and
+prefix-cache hits stay correct. It costs ~60 MB and ~5 µs per layer at short context. Decoding the same text
+token by token (16-token steps), int4 KL goes from 0.0024 / 0.0027 to **0.0009 / 0.0012**, with top-1 at
+99.2% / 99.1%. Without the V2 runner only the sinks apply.
 
 Speed is within ~1–2% of int8 at short context and faster at long context: without MTP, 36.8 vs 34.4 tok/s at
 27k. MTP-3 decodes at 106.8 vs 108.2 tok/s over 16 prompts, with acceptance 3.40 vs 3.44. Switches:
 - `EXL3_KV_INT4=0` uses vLLM's int4 path;
 - `EXL3_KV_MEANS=0` (or a path) disables or replaces the centering means;
-- `EXL3_KV_INT4_CLIP=1` turns off the clip search.
+- `EXL3_KV_INT4_CLIP=1` turns off the clip search;
+- `EXL3_KV_INT4_SINKS` / `EXL3_KV_INT4_TAIL` set the exact rows (defaults 4 / 128; 0 turns them off).
 
 Details are in experiments/0024.
 

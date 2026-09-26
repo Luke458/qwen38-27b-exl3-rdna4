@@ -11,14 +11,14 @@
 #   ./serve.sh 32k --generation-config vllm   extra arguments are passed to `vllm serve`
 #
 # Endpoint: http://127.0.0.1:8000/v1, model "qwen38-27b-exl3". Ctrl-C stops the server.
-# Overrides: MODEL_DIR (default ~/models/qwen3.8-27b-exl3-11.5gb), EXL3_EXT_DIR (default ~/exl3ext,
+# Overrides: MODEL_DIR (default ~/models/qwen3.8-27b-exl3-11.5gb), EXL3_EXT_DIR (default ~/models/exl3ext,
 # built by vllm_plugin/tools/build_ext_in_image.sh), EXL3_TEXT_ONLY=1 to skip the vision tower.
 set -euo pipefail
 HERE=$(dirname "$(realpath "$0")")
 PROFILE=${1:-32k}
 [ $# -gt 0 ] && shift
 MODEL_DIR=${MODEL_DIR:-$HOME/models/qwen3.8-27b-exl3-11.5gb}
-export EXL3_EXT_DIR=${EXL3_EXT_DIR:-$HOME/exl3ext}
+export EXL3_EXT_DIR=${EXL3_EXT_DIR:-$HOME/models/exl3ext}
 
 MTP='{"method":"mtp","num_speculative_tokens":3}'
 KV=int8_per_token_head

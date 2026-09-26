@@ -20,6 +20,10 @@ scale carries the 4-bit zero point in its low mantissa bits. What changes here (
 - The cache write centers K and V with calibrated per-layer channel means (exact: see _load_means) and
   picks each row's 4-bit range by a small clip search instead of min/max. Same bytes, ~31% lower KL
   against an fp16 cache on long text (0.0034 -> 0.0023 prose, 0.0039 -> 0.0027 code).
+- Exact rows (after BeeLlama.cpp's KVarN sinks and KV precision tail): the first 4 slots of every block
+  and each request's newest 128 positions are also kept in fp16 and replace the 4-bit rows in attention
+  (~17 + ~45 MB). Decoding 2 x 16k tokens of held-out text: KL 0.0024 -> 0.0009 (prose), 0.0027 -> 0.0011
+  (code), top-1 99.1%. EXL3_KV_INT4_SINKS / EXL3_KV_INT4_TAIL set the sizes (0 disables).
 """
 from __future__ import annotations
 
@@ -29,7 +33,7 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm.v1.attention.ops.triton_attention_helpers import (cdiv_fn, compute_tile_loop_bounds,
+from vllm.v1.attention.ops.triton_attention_helpers import (cdiv_fn, compute_tile_loop_bounds, find_seq_idx,
                                                             resolve_seq_and_query_len, softmax_step,
                                                             store_segm_reduce_scalars)
 
@@ -37,7 +41,11 @@ from vllm.v1.attention.ops.triton_attention_helpers import (cdiv_fn, compute_til
 # spill (the kernel sits at the 256-VGPR limit); more segments helps long contexts, and the partials
 # buffer is rows x query heads x segments x head size fp32 (16 x 24 x 64 x 256 x 4 = 25 MB).
 _CFG = {"tile_3d": 16, "tile_2d": 32, "warps": 4, "stages": 1, "segments": 64, "rows_3d": 16,
-        "clip_steps": int(os.environ.get("EXL3_KV_INT4_CLIP", "3"))}
+        "clip_steps": int(os.environ.get("EXL3_KV_INT4_CLIP", "3")),
+        # exact (fp16) rows, after BeeLlama.cpp's KVarN sinks / KV precision tail: the first SINKS slots of
+        # every cache block, and each request's newest TAIL positions (experiments/0025)
+        "sinks": int(os.environ.get("EXL3_KV_INT4_SINKS", "4")),
+        "tail": int(os.environ.get("EXL3_KV_INT4_TAIL", "128"))}
 MAX_QLEN_3D = 8
 
 _mats: dict = {}
@@ -46,6 +54,68 @@ _ones: dict = {}
 _last: dict = {}  # last compiled attention kernel (register / spill stats for tuning)
 _means: dict | None = None
 _bias: dict = {}
+_exact: dict = {}  # layer name -> exact-row buffers (see exact_buffers)
+# request slots for the tail ring, fed by plugin._install_kv_int4_request_slots (vLLM's V2 model runner):
+# slot[i] = persistent request-state index of batch row i (rows past the batch map to the scratch ring row)
+_req = {"slot": None, "rows": 0}
+
+
+def configure_request_slots(max_reqs: int) -> None:
+    """The model runner keeps per-request state in max_reqs fixed slots; ring row max_reqs is scratch."""
+    _req["rows"] = max_reqs + 1
+
+
+def _slot_buffer(device) -> torch.Tensor | None:
+    if _req["slot"] is None and _req["rows"] > 0:
+        _req["slot"] = torch.full((1024,), _req["rows"] - 1, dtype=torch.int32, device=device)
+    return _req["slot"]
+
+
+def set_batch_slots(idx_mapping: torch.Tensor) -> None:
+    """Called before each forward (outside graphs): batch row -> request slot, in the persistent buffer that
+    captured kernels read. Rows past the batch (graph padding, dummy runs) point at the scratch row."""
+    buf = _slot_buffer(idx_mapping.device)
+    if buf is None:
+        return
+    n = idx_mapping.shape[0]
+    buf[:n].copy_(idx_mapping)
+    buf[n:].fill_(_req["rows"] - 1)
+
+
+def request_added(idx: int) -> None:
+    """A new request took ring row idx: forget the previous request's tail (tags are positions)."""
+    for b in _exact.values():
+        if b["tag"] is not None:
+            b["tag"][idx].fill_(-1)
+
+
+def exact_buffers(name: str | None, num_blocks: int, heads: int, d: int, device) -> dict | None:
+    """fp16 exact rows for layer `name` in the cache's rotated, centered domain:
+    sink_k/v [num_blocks, SINKS, heads, d]: the first SINKS slots of every block, read for each sequence's
+    first SINKS positions (keyed by physical block, so prefix-cache hits find them);
+    ring_k/v [rows, TAIL, heads, d] + tag [rows, TAIL]: each request's newest TAIL positions, tagged with
+    the position they hold (MTP rollbacks and prefix-cache hits leave stale tags, which never match).
+    Allocated on first (eager) use; None when disabled or first seen during graph capture."""
+    if not name or (_CFG["sinks"] <= 0 and _CFG["tail"] <= 0):
+        return None
+    if name not in _exact:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        sk = _CFG["sinks"]
+        tail = _CFG["tail"] if _slot_buffer(device) is not None else 0
+        rows = max(_req["rows"], 1)
+        # one allocation per layer (four separately rounded buffers cost ~2x the ~3.6 MB of data)
+        sink_n, ring_n = num_blocks * max(sk, 1) * heads * d, rows * max(tail, 1) * heads * d
+        slab = torch.zeros(2 * sink_n + 2 * ring_n, dtype=torch.float16, device=device)
+        parts = slab.split([sink_n, sink_n, ring_n, ring_n])
+        _exact[name] = {
+            "sinks": sk, "tail": tail,
+            "sink_k": parts[0].view(num_blocks, max(sk, 1), heads, d),
+            "sink_v": parts[1].view(num_blocks, max(sk, 1), heads, d),
+            "ring_k": parts[2].view(rows, max(tail, 1), heads, d),
+            "ring_v": parts[3].view(rows, max(tail, 1), heads, d),
+            "tag": torch.full((rows, max(tail, 1)), -1, dtype=torch.int32, device=device) if tail else None}
+    return _exact[name]
 
 
 def _load_means() -> dict:
@@ -104,11 +174,13 @@ def rht_matrices(d: int, device) -> dict:
 
 
 def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping, *, k_scale_cache, v_scale_cache,
-                      layer_name: str | None = None):
+                      layer_name: str | None = None, query_start_loc=None, seq_lens=None):
     """Rotate + quantize + pack K and V into the cache (vLLM's reshape_and_cache_int4 format; ranges from the
     fp32 rotation with a clip search), centered with the layer's calibrated means if any. Two launches for
     both sides: a GEMM-style rotation into an fp32 buffer, then one program per row for the quantization
-    (a fused version ran one program for a decode step's 4 rows: 56 us per side)."""
+    (a fused version ran one program for a decode step's 4 rows: 56 us per side). With the layer's exact
+    buffers, the fp32 rotation is also stored in fp16 for sink slots and (given the batch's query_start_loc /
+    seq_lens) for tokens among their request's newest TAIL positions."""
     d = key.shape[-1]
     f = rht_matrices(d, key.device)["fwd"]
     n = min(key.shape[0], slot_mapping.shape[0])
@@ -123,14 +195,22 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping, *, k_sca
         key.stride(0), key.stride(1), value.stride(0), value.stride(1),
         D=d, BLOCK_R=16, BLOCK_K=32, HAS_BIAS=bias is not None, num_warps=4)
     steps = _CFG["clip_steps"]
+    ex = exact_buffers(layer_name, key_cache.shape[0], heads, d, key.device)
+    sinks = ex["sinks"] if ex else 0
+    tail = ex["tail"] if ex is not None and query_start_loc is not None else 0
+    dummy = y
     _quant_pack[(rows, 2)](
         y, key_cache, value_cache, k_scale_cache, v_scale_cache, slot_mapping, rows, heads,
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
         value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
         k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
         v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),
+        ex["sink_k"] if sinks else dummy, ex["sink_v"] if sinks else dummy,
+        ex["ring_k"] if tail else dummy, ex["ring_v"] if tail else dummy, ex["tag"] if tail else dummy,
+        _req["slot"] if tail else dummy, query_start_loc if tail else dummy, seq_lens if tail else dummy,
+        seq_lens.shape[0] if tail else 0,
         BLOCK_SIZE=key_cache.shape[1], D=d, CLIP_STEPS=steps, CLIP_STEP=0.075,
-        NC=triton.next_power_of_2(steps * steps), num_warps=4)
+        NC=triton.next_power_of_2(steps * steps), SINKS=sinks, TAIL=tail, num_warps=4)
 
 
 @triton.jit
@@ -192,8 +272,9 @@ def _rotate_kv(k_ptr, v_ptr, m_ptr, kb_ptr, vb_ptr, y_ptr, slot_ptr, rows, heads
 @triton.jit
 def _quant_pack(y_ptr, kc_ptr, vc_ptr, ks_ptr, vs_ptr, slot_ptr, rows, heads,
                 kc_blk, kc_slot, kc_head, vc_blk, vc_slot, vc_head, ks_blk, ks_slot, ks_head, vs_blk, vs_slot, vs_head,
+                sk_ptr, sv_ptr, rk_ptr, rv_ptr, tag_ptr, rslot_ptr, qsl_ptr, seqlen_ptr, num_seqs,
                 BLOCK_SIZE: tl.constexpr, D: tl.constexpr, CLIP_STEPS: tl.constexpr, CLIP_STEP: tl.constexpr,
-                NC: tl.constexpr):
+                NC: tl.constexpr, SINKS: tl.constexpr, TAIL: tl.constexpr):
     """Cache write, step 2, one (row, side) per program: asymmetric 4-bit with vLLM's rounding (half away
     from zero), two nibbles per byte (element 2i low), zero point in the fp32 scale's low mantissa bits.
     Clip search: the row's range [lo, hi] is shrunk toward the row mean by 0, CLIP_STEP, ... at each end
@@ -236,20 +317,105 @@ def _quant_pack(y_ptr, kc_ptr, vc_ptr, ks_ptr, vs_ptr, slot_ptr, rows, heads,
     else:
         tl.store(vc_ptr + blk * vc_blk + sl * vc_slot + h * vc_head + offs_b, packed)
         tl.store(vs_ptr + blk * vs_blk + sl * vs_slot + h * vs_head, sbits)
+    if SINKS > 0:  # exact copy of every block's first SINKS slots
+        if sl < SINKS:
+            e_off = ((blk * SINKS + sl) * heads + h) * D + offs
+            if side == 0:
+                tl.store(sk_ptr + e_off, y.to(tl.float16))
+            else:
+                tl.store(sv_ptr + e_off, y.to(tl.float16))
+    if TAIL > 0:  # exact copy of the request's newest TAIL positions, in a ring tagged with the position
+        row = find_seq_idx(qsl_ptr, t, num_seqs, 1, False)
+        q0 = tl.load(qsl_ptr + row)
+        q1 = tl.load(qsl_ptr + row + 1)
+        seq_len = tl.load(seqlen_ptr + row)
+        pos = seq_len - (q1 - q0) + (t - q0)
+        if pos >= seq_len - TAIL:
+            rs = tl.load(rslot_ptr + row).to(tl.int64)
+            ri = pos % TAIL
+            r_off = ((rs * TAIL + ri) * heads + h) * D + offs
+            if side == 0:
+                tl.store(rk_ptr + r_off, y.to(tl.float16))
+                if h == 0:
+                    tl.store(tag_ptr + rs * TAIL + ri, pos)
+            else:
+                tl.store(rv_ptr + r_off, y.to(tl.float16))
+
+
+@triton.jit
+def _attn_tile(j, q, m_i, l_i, acc, q_mask, query_abs, offs_t, offs_h, offs_d, max_prefix, bt_row,
+               kc_ptr, vc_ptr, ks_ptr, vs_ptr, kv_head_idx, scale,
+               k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, ks_s0, ks_s1, ks_s2, vs_s0, vs_s1, vs_s2,
+               sk_ptr, sv_ptr, rk_ptr, rv_ptr, tag_ptr, rs, tail_lo,
+               BLOCK_SIZE: tl.constexpr, TILE_SIZE: tl.constexpr, HALF: tl.constexpr, HKV: tl.constexpr,
+               SINKS: tl.constexpr, TAIL: tl.constexpr):
+    """One TILE_SIZE-token step of _attn_int4's online softmax. SINKS > 0: positions < SINKS read the exact
+    sink rows (the sequence's first block); TAIL > 0: positions >= tail_lo whose ring tag matches read the
+    exact ring rows. Exact rows are fp16 in the same rotated domain with scale 1."""
+    D2: tl.constexpr = 2 * HALF
+    seq_off = j * TILE_SIZE + offs_t
+    tmask = seq_off < max_prefix
+    blk = tl.load(bt_row + seq_off // BLOCK_SIZE).to(tl.int64)
+    slot = (seq_off % BLOCK_SIZE).to(tl.int64)
+    ksb = tl.load(ks_ptr + blk * ks_s0 + slot * ks_s1 + kv_head_idx * ks_s2, mask=tmask, other=0).to(
+        tl.int32, bitcast=True)
+    vsb = tl.load(vs_ptr + blk * vs_s0 + slot * vs_s1 + kv_head_idx * vs_s2, mask=tmask, other=0).to(
+        tl.int32, bitcast=True)
+    # K bytes [TILE, HALF] -> [TILE, 2*HALF] in natural order (low nibble = even element), minus zero point
+    kp = tl.load(kc_ptr + blk[:, None] * k_s0 + slot[:, None] * k_s1 + kv_head_idx * k_s2 + offs_h[None, :],
+                 mask=tmask[:, None], other=0).to(tl.int32)
+    kz = (ksb & 0xF)[:, None]
+    k = tl.reshape(tl.join((kp & 0xF) - kz, ((kp >> 4) & 0xF) - kz), (TILE_SIZE, D2)).to(tl.float16)
+    k_sc = (ksb & -16).to(tl.float32, bitcast=True)
+    if SINKS > 0:
+        is_x = (seq_off < SINKS) & tmask
+        x_off = ((blk * SINKS + slot) * HKV + kv_head_idx) * D2
+        k = tl.where(is_x[:, None], tl.load(sk_ptr + x_off[:, None] + offs_d[None, :], mask=is_x[:, None],
+                                            other=0.0), k)
+        k_sc = tl.where(is_x, 1.0, k_sc)
+    if TAIL > 0:
+        ri = seq_off % TAIL
+        is_t = tl.load(tag_ptr + rs * TAIL + ri, mask=tmask & (seq_off >= tail_lo), other=-1) == seq_off
+        t_off = ((rs * TAIL + ri) * HKV + kv_head_idx) * D2
+        k = tl.where(is_t[:, None], tl.load(rk_ptr + t_off[:, None] + offs_d[None, :], mask=is_t[:, None],
+                                            other=0.0), k)
+        k_sc = tl.where(is_t, 1.0, k_sc)
+    s = tl.dot(q, tl.trans(k)) * (scale * k_sc[None, :])
+    s = tl.where(q_mask & (seq_off[None, :] <= query_abs), s, float("-inf"))
+    m_i, l_i, p, alpha = softmax_step(s, m_i, l_i)
+    vp = tl.load(vc_ptr + blk[:, None] * v_s0 + slot[:, None] * v_s1 + kv_head_idx * v_s2 + offs_h[None, :],
+                 mask=tmask[:, None], other=0).to(tl.int32)
+    vz = (vsb & 0xF)[:, None]
+    v = tl.reshape(tl.join((vp & 0xF) - vz, ((vp >> 4) & 0xF) - vz), (TILE_SIZE, D2)).to(tl.float16)
+    v_sc = (vsb & -16).to(tl.float32, bitcast=True)
+    if SINKS > 0:
+        v = tl.where(is_x[:, None], tl.load(sv_ptr + x_off[:, None] + offs_d[None, :], mask=is_x[:, None],
+                                            other=0.0), v)
+        v_sc = tl.where(is_x, 1.0, v_sc)
+    if TAIL > 0:
+        v = tl.where(is_t[:, None], tl.load(rv_ptr + t_off[:, None] + offs_d[None, :], mask=is_t[:, None],
+                                            other=0.0), v)
+        v_sc = tl.where(is_t, 1.0, v_sc)
+    pv = (p * v_sc[None, :]).to(tl.float16)
+    acc = acc * alpha[:, None] + tl.dot(pv, v)
+    return m_i, l_i, acc
 
 
 @triton.jit
 def _attn_int4(out_ptr, segm_out_ptr, segm_max_ptr, segm_sum_ptr, q_ptr, kc_ptr, vc_ptr, bt_ptr, seq_lens_ptr,
-               qsl_ptr, ks_ptr, vs_ptr, scale, num_seqs,
+               qsl_ptr, ks_ptr, vs_ptr, scale, num_seqs, sk_ptr, sv_ptr, rk_ptr, rv_ptr, tag_ptr, rslot_ptr,
                bt_stride: tl.int64, q_s0: tl.int64, q_s1: tl.int64, o_s0: tl.int64, o_s1: tl.int64,
                k_s0: tl.int64, k_s1: tl.int64, k_s2: tl.int64, v_s0: tl.int64, v_s1: tl.int64, v_s2: tl.int64,
                ks_s0: tl.int64, ks_s1: tl.int64, ks_s2: tl.int64, vs_s0: tl.int64, vs_s1: tl.int64,
                vs_s2: tl.int64,
                num_query_heads: tl.constexpr, num_queries_per_kv: tl.constexpr, BLOCK_SIZE: tl.constexpr,
                TILE_SIZE: tl.constexpr, HEAD_SIZE_PADDED: tl.constexpr, HALF: tl.constexpr,
-               BLOCK_Q: tl.constexpr, BLOCK_M: tl.constexpr, NUM_SEGMENTS: tl.constexpr, IS_3D: tl.constexpr):
+               BLOCK_Q: tl.constexpr, BLOCK_M: tl.constexpr, NUM_SEGMENTS: tl.constexpr, IS_3D: tl.constexpr,
+               SINKS: tl.constexpr = 0, TAIL: tl.constexpr = 0):
     """Causal paged attention over the int4 cache. q is RHT-rotated (and the scale folded in by the caller);
-    the output stays rotated. 3D: per-segment partials for vLLM's reduce_segments."""
+    the output stays rotated. 3D: per-segment partials for vLLM's reduce_segments. Exact rows (fp16, same
+    rotated domain, scale 1) replace the 4-bit ones for the sequence's first SINKS positions and its newest
+    TAIL positions whose ring tag matches (see _attn_tile)."""
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2) if IS_3D else 0
@@ -285,30 +451,39 @@ def _attn_int4(out_ptr, segm_out_ptr, segm_max_ptr, segm_sum_ptr, q_ptr, kc_ptr,
         num_queries_per_kv, 0, False, IS_3D)
     bt_row = bt_ptr + seq_idx * bt_stride
     query_abs = context_len + query_pos[:, None]
+    HKV: tl.constexpr = num_query_heads // num_queries_per_kv
+    tail_lo = seq_len - TAIL
+    if TAIL > 0:
+        rs = tl.load(rslot_ptr + seq_idx).to(tl.int64)
+    else:
+        rs = 0
 
-    for j in range(loop_lo, loop_hi):
-        seq_off = j * TILE_SIZE + offs_t
-        tmask = seq_off < max_prefix
-        blk = tl.load(bt_row + seq_off // BLOCK_SIZE).to(tl.int64)
-        slot = (seq_off % BLOCK_SIZE).to(tl.int64)
-        ksb = tl.load(ks_ptr + blk * ks_s0 + slot * ks_s1 + kv_head_idx * ks_s2, mask=tmask, other=0).to(
-            tl.int32, bitcast=True)
-        vsb = tl.load(vs_ptr + blk * vs_s0 + slot * vs_s1 + kv_head_idx * vs_s2, mask=tmask, other=0).to(
-            tl.int32, bitcast=True)
-        # K bytes [TILE, HALF] -> [TILE, 2*HALF] in natural order (low nibble = even element), minus zero point
-        kp = tl.load(kc_ptr + blk[:, None] * k_s0 + slot[:, None] * k_s1 + kv_head_idx * k_s2 + offs_h[None, :],
-                     mask=tmask[:, None], other=0).to(tl.int32)
-        kz = (ksb & 0xF)[:, None]
-        k = tl.reshape(tl.join((kp & 0xF) - kz, ((kp >> 4) & 0xF) - kz), (TILE_SIZE, 2 * HALF)).to(tl.float16)
-        s = tl.dot(q, tl.trans(k)) * (scale * (ksb & -16).to(tl.float32, bitcast=True)[None, :])
-        s = tl.where(q_mask & (seq_off[None, :] <= query_abs), s, float("-inf"))
-        m_i, l_i, p, alpha = softmax_step(s, m_i, l_i)
-        vp = tl.load(vc_ptr + blk[:, None] * v_s0 + slot[:, None] * v_s1 + kv_head_idx * v_s2 + offs_h[None, :],
-                     mask=tmask[:, None], other=0).to(tl.int32)
-        vz = (vsb & 0xF)[:, None]
-        v = tl.reshape(tl.join((vp & 0xF) - vz, ((vp >> 4) & 0xF) - vz), (TILE_SIZE, 2 * HALF)).to(tl.float16)
-        pv = (p * (vsb & -16).to(tl.float32, bitcast=True)[None, :]).to(tl.float16)
-        acc = acc * alpha[:, None] + tl.dot(pv, v)
+    # three passes so the common tiles run the plain 4-bit body (substituting exact rows inside every tile
+    # pushed the kernel to 256 VGPRs with spills: +55% at 32k): tile 0 with the sinks, the body, and the
+    # tiles overlapping the tail window (with the sinks too when the sequence is that short)
+    tail_start = tl.maximum(tail_lo // TILE_SIZE, 0) if TAIL > 0 else loop_hi
+    j_lo = loop_lo
+    if SINKS > 0:
+        if (loop_lo == 0) & (loop_hi > 0) & (tail_start > 0):
+            m_i, l_i, acc = _attn_tile(0, q, m_i, l_i, acc, q_mask, query_abs, offs_t, offs_h, offs_d, max_prefix,
+                                       bt_row, kc_ptr, vc_ptr, ks_ptr, vs_ptr, kv_head_idx, scale,
+                                       k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, ks_s0, ks_s1, ks_s2, vs_s0, vs_s1, vs_s2,
+                                       sk_ptr, sv_ptr, rk_ptr, rv_ptr, tag_ptr, rs, tail_lo,
+                                       BLOCK_SIZE, TILE_SIZE, HALF, HKV, SINKS, 0)
+            j_lo = 1
+    for j in range(j_lo, tl.minimum(loop_hi, tail_start)):
+        m_i, l_i, acc = _attn_tile(j, q, m_i, l_i, acc, q_mask, query_abs, offs_t, offs_h, offs_d, max_prefix,
+                                   bt_row, kc_ptr, vc_ptr, ks_ptr, vs_ptr, kv_head_idx, scale,
+                                   k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, ks_s0, ks_s1, ks_s2, vs_s0, vs_s1, vs_s2,
+                                   sk_ptr, sv_ptr, rk_ptr, rv_ptr, tag_ptr, rs, tail_lo,
+                                   BLOCK_SIZE, TILE_SIZE, HALF, HKV, 0, 0)
+    if TAIL > 0:
+        for j in range(tl.maximum(j_lo, tail_start), loop_hi):
+            m_i, l_i, acc = _attn_tile(j, q, m_i, l_i, acc, q_mask, query_abs, offs_t, offs_h, offs_d, max_prefix,
+                                       bt_row, kc_ptr, vc_ptr, ks_ptr, vs_ptr, kv_head_idx, scale,
+                                       k_s0, k_s1, k_s2, v_s0, v_s1, v_s2, ks_s0, ks_s1, ks_s2, vs_s0, vs_s1,
+                                       vs_s2, sk_ptr, sv_ptr, rk_ptr, rv_ptr, tag_ptr, rs, tail_lo,
+                                       BLOCK_SIZE, TILE_SIZE, HALF, HKV, SINKS, TAIL)
 
     if IS_3D:
         base = (qo0[:, None].to(tl.int64) * (num_query_heads * NUM_SEGMENTS * HEAD_SIZE_PADDED)
@@ -363,15 +538,19 @@ def attention(*, q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, block_tabl
     tile = tile_size or (_CFG["tile_3d"] if use_3d else _CFG["tile_2d"])
     rot = torch.empty_like(q)
     grid = (q.shape[0] // block_q + num_seqs, hkv) + ((segs,) if use_3d else ())
+    ex = _exact.get(layer_name) if layer_name else None
+    sinks, tail = (ex["sinks"], ex["tail"]) if ex else (0, 0)
     _last["kernel"] = _attn_int4[grid](
         rot, so if use_3d else rot, sm if use_3d else rot, ss if use_3d else rot, qr, k, v, block_table, seqused_k,
         cu_seqlens_q, k_scale_cache, v_scale_cache, softmax_scale / d, num_seqs,
+        ex["sink_k"] if sinks else rot, ex["sink_v"] if sinks else rot, ex["ring_k"] if tail else rot,
+        ex["ring_v"] if tail else rot, ex["tag"] if tail else rot, _req["slot"] if tail else rot,
         block_table.stride(0), qr.stride(0), qr.stride(1), rot.stride(0), rot.stride(1),
         k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2),
         k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
         v_scale_cache.stride(0), v_scale_cache.stride(1), v_scale_cache.stride(2),
         num_query_heads=hq, num_queries_per_kv=nq, BLOCK_SIZE=v.shape[1], TILE_SIZE=tile, HEAD_SIZE_PADDED=dpad,
-        HALF=d // 2, BLOCK_Q=block_q, BLOCK_M=block_m, NUM_SEGMENTS=segs, IS_3D=use_3d,
+        HALF=d // 2, BLOCK_Q=block_q, BLOCK_M=block_m, NUM_SEGMENTS=segs, IS_3D=use_3d, SINKS=sinks, TAIL=tail,
         num_warps=num_warps or _CFG["warps"], num_stages=num_stages or _CFG["stages"])
     if use_3d:
         reduce_segments[(q.shape[0], hq)](
@@ -382,6 +561,30 @@ def attention(*, q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, block_tabl
             NUM_SEGMENTS_PER_SEQ=segs, USE_FP8=False)
     # un-rotate: out = rot @ (H D) / d (the unnormalized RHT scaled q and v by sqrt(d) each), + value mean
     rotate(rot, mats["inv_d"], out=out, bias=_out_bias(layer_bias(layer_name, hkv, d, q.device), hq))
+
+
+@triton.jit
+def _tail_overlay(kd_ptr, vd_ptr, rk_ptr, rv_ptr, tag_ptr, rslot_ptr, seqlen_ptr, nb, mul,
+                  BLOCK_SIZE: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr, TAIL: tl.constexpr):
+    """Prefill copy (gather_dequant_int4 layout [seq * nb + block, slot, head, D]): overwrite each sequence's
+    newest TAIL positions with the exact ring rows whose tag matches, scaled to the orthonormal domain."""
+    s = tl.program_id(0)
+    i = tl.program_id(1)
+    h = tl.program_id(2)
+    seq_len = tl.load(seqlen_ptr + s)
+    pos = seq_len - TAIL + i
+    if pos < 0:
+        return
+    rs = tl.load(rslot_ptr + s).to(tl.int64)
+    ri = pos % TAIL
+    if tl.load(tag_ptr + rs * TAIL + ri) != pos:
+        return
+    offs = tl.arange(0, D)
+    src = ((rs * TAIL + ri) * NKV + h) * D + offs
+    j = (s * nb + pos // BLOCK_SIZE).to(tl.int64)
+    dst = ((j * BLOCK_SIZE + pos % BLOCK_SIZE) * NKV + h) * D + offs
+    tl.store(kd_ptr + dst, (tl.load(rk_ptr + src).to(tl.float32) * mul).to(kd_ptr.dtype.element_ty))
+    tl.store(vd_ptr + dst, (tl.load(rv_ptr + src).to(tl.float32) * mul).to(vd_ptr.dtype.element_ty))
 
 
 def prefill(orig, kw, layer_name: str | None = None):
@@ -397,8 +600,16 @@ def prefill(orig, kw, layer_name: str | None = None):
     nb = (int(kw["max_seqlen_k"]) + bsz - 1) // bsz
     used = bt[:, :nb]
     flat = used.reshape(-1)
-    kd = gather_dequant_int4(k, kw["k_scale_cache"], flat, d, q.dtype, "k", cap=bt.numel())
-    vd = gather_dequant_int4(v, kw["v_scale_cache"], flat, d, q.dtype, "v", cap=bt.numel())
+    ex = _exact.get(layer_name) if layer_name else None
+    kd = gather_dequant_int4(k, kw["k_scale_cache"], flat, d, q.dtype, "k", cap=bt.numel(),
+                             sinks=ex["sink_k"] if ex and ex["sinks"] else None, nb=nb)
+    vd = gather_dequant_int4(v, kw["v_scale_cache"], flat, d, q.dtype, "v", cap=bt.numel(),
+                             sinks=ex["sink_v"] if ex and ex["sinks"] else None, nb=nb)
+    if ex and ex["tail"]:
+        seq_lens = kw["seqused_k"]
+        _tail_overlay[(seq_lens.shape[0], ex["tail"], k.shape[2])](
+            kd, vd, ex["ring_k"], ex["ring_v"], ex["tag"], _req["slot"], seq_lens, nb, d ** -0.5,
+            BLOCK_SIZE=bsz, NKV=k.shape[2], D=d, TAIL=ex["tail"])
     if q.device not in _ones:
         _ones[q.device] = torch.ones((1, 1), dtype=torch.float32, device=q.device)
     desc = _ones[q.device].expand(bt.shape[0], kd.shape[2])
