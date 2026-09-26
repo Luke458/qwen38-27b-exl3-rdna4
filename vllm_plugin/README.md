@@ -16,13 +16,16 @@ Status: experimental. It has been tested only with the GestaltLabs Qwen3.8-27B E
 |---|---|
 | `exl3rocm/plugin.py` | `exl3` quantization config, per-checkpoint-tensor ("group") linear method, fp8 embedding method |
 | `exl3rocm/ops.py` | opaque torch custom ops over the compiled kernel extension |
-| `exl3rocm/kv_dequant.py` | Triton gather + dequantize of 8-bit KV blocks for prefill attention |
+| `exl3rocm/kv_dequant.py` | Triton gather + dequantize of 8-bit and 4-bit KV blocks for prefill attention |
+| `exl3rocm/kv_int4.py` | 4-bit KV cache (`int4_per_token_head`): cache write, decode / MTP-verify attention, prefill |
+| `exl3rocm/kv_means.pt` | per-layer K/V channel means that center the 4-bit cache (from `tools/calib_kv_means.py`) |
 | `run_exl3_server.sh` | podman launcher for an EXL3 checkpoint |
 | `tools/build_ext_in_image.sh` | build the kernel extension against the image's torch |
 | `tools/run_base_server.sh` | launcher for unquantized models (engine baselines) |
 | `tools/bench_client.py` | single-stream decode benchmark (OpenAI API) |
 | `tools/longctx_bench.py`, `tools/concurrency_bench.py` | long-prompt prefill/decode, concurrent streams |
 | `tools/mem_probe.sh` | start a profile, report KV capacity and peak VRAM under stress |
+| `tools/calib_kv_means.py` | recompute `kv_means.pt` (run inside the image) |
 | `patches/exl3-fork/` | kernel patches on the pinned fork (decode GEMV, multi-row verify GEMV, graph-safe fused Hadamard) |
 | `patches/vllm-0.28.0-rdna4/` | vLLM GDN metadata patch, mounted over the image by the launcher |
 | `tests/xcheck_ext.py` | bitwise cross-check of two extension builds |
@@ -53,6 +56,8 @@ desktop's VRAM comes on top of it, and the card has 16,304 MiB, so keep the tota
 | **single user, MTP-3, 32k** | `--max-model-len 32768 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 35,108 | **14,755 MiB** | **~80 tok/s** (prose 80 / code 99 / story 65) | 32k tokens at 1.0k tok/s |
 | single user, MTP-3, 40k | same with `--max-model-len 40960 --kv-cache-memory-bytes 2050000000` | 44,063 | 15,122 MiB | ~78 tok/s | 40k tokens at 0.95k tok/s |
 | multi-user / long context | `--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000` | 72,238 | 15,171 MiB | 42 tok/s; **199 tok/s** total at 8 streams | 60k tokens at 0.83k tok/s |
+| **4-bit KV, MTP-3, 48k** | 32k's MTP flags with `--kv-cache-dtype int4_per_token_head --max-model-len 49152 --kv-cache-memory-bytes 1460000000` | 53,426 | 14,665 MiB (41k prompt + image) | ~80 tok/s; 72 at 41k | 41k tokens at 0.96k tok/s |
+| **4-bit KV, MTP-3, 64k** | same with `--max-model-len 65536 --kv-cache-memory-bytes 1760000000` | 70,217 | 14.5–14.8 GiB text-only at 53–62k; ~15.1–15.3 GiB with vision (est.) | ~80 tok/s; 63–68 at 53–62k | 61.8k tokens at 0.78k tok/s |
 
 The 40k and 64k profiles fit with a desktop of up to ~0.9 GiB of VRAM, and the 32k profile with up to ~1.3 GiB. The
 MTP 2- and 4-stream totals (111 and 124 tok/s) and the plain 2- and 4-stream totals (70 and 128 tok/s) were
@@ -79,6 +84,36 @@ prompt near max-model-len needs a few more pages. With none spare, a 31.5k promp
 on prefill with 8-bit KV, so for prefill chunks the plugin dequantizes the sequence's KV blocks into a persistent fp16
 buffer (`exl3rocm/kv_dequant.py`) and runs the fp16 kernel on them. Decode reads int8 directly. Do not set
 `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True`: it caused a GPU memory-access fault here.
+
+**4-bit KV cache** (`--kv-cache-dtype int4_per_token_head`, profiles `48k-int4` / `64k-int4` in `serve.sh`). It
+takes half the bytes of int8. Because the GDN state pages cost the same, a KV page holds 1,616 tokens instead of 816.
+So 64k with MTP fits in the 32k profile's pool, and 48k fits in less. vLLM has this format, but its path was
+unusable here. Its Hadamard transforms ran as a PyTorch butterfly, and its MTP verify step was not split across
+the context (38 ms per attention layer at 32k). The plugin replaces the whole path with `exl3rocm/kv_int4.py`
+and keeps the cache format:
+- the rotations run as small Triton GEMMs;
+- a split-KV fp16-dot kernel handles decode and MTP verify (0.3 ms per layer at 32k, vs 0.5 ms for int8);
+- prefill uses the same fp16 dequantize path as int8;
+- the cache write centers K and V with calibrated per-layer means, which is exact, and picks each row's 4-bit
+  range with a small clip search.
+
+Accuracy against an fp16 cache on 2 × 16k tokens of held-out text (prose / code):
+- int4: KL 0.0023 / 0.0027, top-1 98.7%, NLL +0.2%;
+- vLLM's int4: KL 0.0035 / 0.0039;
+- int8: 0.00007.
+
+Speed is within ~1–2% of int8 at short context and faster at long context: without MTP, 36.8 vs 34.4 tok/s at
+27k. MTP-3 decodes at 106.8 vs 108.2 tok/s over 16 prompts, with acceptance 3.40 vs 3.44. Switches:
+- `EXL3_KV_INT4=0` uses vLLM's int4 path;
+- `EXL3_KV_MEANS=0` (or a path) disables or replaces the centering means;
+- `EXL3_KV_INT4_CLIP=1` turns off the clip search.
+
+Details are in experiments/0024.
+
+**Text-only compile cache.** torch.compile's cache key does not cover the multimodal settings, and a graph
+compiled with `EXL3_TEXT_ONLY=1` fails when a vision-enabled server with the same flags loads it
+(`'NoneType' object has no attribute 'size'`). The launcher therefore gives text-only runs their own cache
+(`~/.cache/vllm-rdna4-exl3-textonly`).
 
 **Memory.** Model load is 10.86 GiB with MTP and 10.66 GiB without. vLLM always shares the target's embedding and lm_head with the MTP drafter, so the
 plugin gives the drafter 0-size placeholders instead of loading them a second time (−0.8 GiB). The vision `attn.qkv`

@@ -16,10 +16,13 @@ No weights or compiled binaries are distributed here.
 |---|---:|---:|---|
 | single user (MTP-3 speculative decoding) | 32k (40k option) | **~80 tok/s** (code ~99, prose ~80) | vision loaded |
 | multi-user / long context | 64k | 42 tok/s single stream, **~200 tok/s** total at 8 streams | vision loaded |
+| single user, 4-bit KV cache (MTP-3) | **48k** (same VRAM as 32k) or **64k** | ~80 tok/s; 68–72 at 41–53k | vision loaded; slightly less accurate |
 | R9700 32 GB, long context (MTP-3) | 128k / 262k | expected ~80 tok/s at short context | sized, not yet run on a 32 GB card |
 
 Prompt processing runs at about 1.5–1.6k tok/s, and ~1k tok/s near 32k tokens. The KV cache is int8, and its
-teacher-forced logits match an fp16 KV cache. The server peaks at 14.4–14.8 GiB of the card's 15.9 GiB, depending on the profile,
+teacher-forced logits match an fp16 KV cache. The 4-bit KV profiles hold twice as many tokens per byte. Their
+logits are close to fp16 but measurably different: KL 0.0023–0.0027 on long text vs 0.00007 for int8, top-1
+agreement 98.7%. The server peaks at 14.4–14.8 GiB of the card's 15.9 GiB, depending on the profile,
 leaving room for a desktop session on the same card. Measured on 2026-09-26; details are in the
 [plugin README](vllm_plugin/README.md).
 
@@ -53,7 +56,8 @@ EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh ./models/qwen38-27b-exl3 q
 ```
 
 Step 3 is also available as `./serve.sh`, which runs the profiles with the defaults above: `./serve.sh`
-(32k with MTP), `./serve.sh 40k` or `./serve.sh 64k`, and on a 32 GB card `./serve.sh 128k` or `./serve.sh 256k`.
+(32k with MTP), `./serve.sh 40k`, `./serve.sh 48k-int4`, `./serve.sh 64k-int4` or `./serve.sh 64k`, and on a
+32 GB card `./serve.sh 128k` or `./serve.sh 256k`.
 It checks VRAM headroom before starting. Set `MODEL_DIR` if the
 model is somewhere other than `~/models/qwen3.8-27b-exl3-11.5gb`.
 

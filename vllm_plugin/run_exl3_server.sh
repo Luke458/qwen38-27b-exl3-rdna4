@@ -11,7 +11,12 @@ HERE=$(dirname "$(realpath "$0")")
 MODEL_DIR=$(realpath "$1"); NAME=$2; shift 2
 : "${EXL3_EXT_DIR:?set EXL3_EXT_DIR to the directory holding the container-built exllamav3_ext .so}"
 IMAGE=docker.io/capicua25x/vllm-rocm-rdna4:0.28.0-rdna4
-mkdir -p "$HOME/.cache/vllm-rdna4-exl3"
+# torch.compile's cache key does not cover the multimodal settings: a graph compiled text-only fails when
+# loaded with vision on ("'NoneType' object has no attribute 'size'" in qwen3_next forward), so text-only
+# runs keep their own cache (experiments/0024)
+CACHE_DIR="$HOME/.cache/vllm-rdna4-exl3"
+[ "${EXL3_TEXT_ONLY:-0}" = "1" ] && CACHE_DIR="$HOME/.cache/vllm-rdna4-exl3-textonly"
+mkdir -p "$CACHE_DIR"
 ARGS=$(printf ' %q' "$@")
 # forward every EXL3_* tuning/debug variable into the container
 ENV_FWD=""
@@ -33,7 +38,7 @@ exec podman run --rm --name vllm-exl3 \
   -v "$MODEL_DIR":/model:ro \
   -v "$HERE":/plugin:ro \
   -v "$(realpath "$EXL3_EXT_DIR")":/exl3ext:ro \
-  -v "$HOME/.cache/vllm-rdna4-exl3":/root/.cache/vllm \
+  -v "$CACHE_DIR":/root/.cache/vllm \
   $GDN_MOUNT ${EXTRA_MOUNTS:-} $ENV_FWD \
   -e PYTHONPATH=/exl3ext -e GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-1} \
   -e VLLM_USE_V2_MODEL_RUNNER=${EXL3_V2_RUNNER:-1} \

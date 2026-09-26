@@ -3,6 +3,8 @@
 #
 #   ./serve.sh            32k context, MTP speculative decoding (~80 tok/s)   [default]
 #   ./serve.sh 40k        40k context, MTP
+#   ./serve.sh 48k-int4   48k context, MTP, 4-bit KV cache (same VRAM as 32k; slightly less accurate)
+#   ./serve.sh 64k-int4   64k context, MTP, 4-bit KV cache (VRAM of the 40k profile)
 #   ./serve.sh 64k        64k context, no MTP, up to 8 concurrent requests
 #   ./serve.sh 128k       128k context, MTP      (32 GB cards, e.g. Radeon AI PRO R9700; untested)
 #   ./serve.sh 256k       262k context, MTP      (32 GB cards; the model's maximum; untested)
@@ -19,18 +21,24 @@ MODEL_DIR=${MODEL_DIR:-$HOME/models/qwen3.8-27b-exl3-11.5gb}
 export EXL3_EXT_DIR=${EXL3_EXT_DIR:-$HOME/exl3ext}
 
 MTP='{"method":"mtp","num_speculative_tokens":3}'
+KV=int8_per_token_head
 MIN_TOTAL=0  # MiB of VRAM the card must have
 # 16 GB profiles: measured server peaks (experiments/0023). 32 GB profiles: KV sized with the same
 # 28,853,760-byte page math (3+ spare pages, see the plugin's KV headroom check); peaks estimated as
 # measured non-KV footprint + KV + the long-prefill fp16 KV copy. Not run on a 32 GB card yet.
+# int4 profiles (experiments/0024): 1,616-token pages of 29,010,432 bytes, 3+ spare. 48k-int4 peaked at
+# 14,665 MiB with a 41k prompt and an image; 64k-int4 at 14.5-14.8 GiB text-only at 53-62k, so ~15.2 GiB with
+# vision (estimated: a full-length vision run did not fit next to a 1.1 GiB desktop).
 case "$PROFILE" in
   32k) PEAK=14755; ARGS=(--max-model-len 32768 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config "$MTP") ;;
   40k) PEAK=15122; ARGS=(--max-model-len 40960 --max-num-seqs 4 --kv-cache-memory-bytes 2050000000 --speculative-config "$MTP") ;;
+  48k-int4) PEAK=14700; KV=int4_per_token_head; ARGS=(--max-model-len 49152 --max-num-seqs 4 --kv-cache-memory-bytes 1460000000 --speculative-config "$MTP") ;;
+  64k-int4) PEAK=15200; KV=int4_per_token_head; ARGS=(--max-model-len 65536 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config "$MTP") ;;
   64k) PEAK=15171; ARGS=(--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000) ;;
   128k) PEAK=18700; MIN_TOTAL=30000; ARGS=(--max-model-len 131072 --max-num-seqs 4 --kv-cache-memory-bytes 5250000000 --speculative-config "$MTP") ;;
   256k) PEAK=23800; MIN_TOTAL=30000; ARGS=(--max-model-len 262144 --max-num-seqs 4 --kv-cache-memory-bytes 9900000000 --speculative-config "$MTP") ;;
-  -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  *) echo "unknown profile '$PROFILE' (use 32k, 40k, 64k, or on a 32 GB card 128k / 256k)" >&2; exit 2 ;;
+  -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "unknown profile '$PROFILE' (use 32k, 40k, 48k-int4, 64k-int4, 64k, or on a 32 GB card 128k / 256k)" >&2; exit 2 ;;
 esac
 
 vram_mib() {  # prints "<used> <total>" in MiB, or nothing if rocm-smi is unavailable
@@ -62,7 +70,7 @@ fi
 echo "starting $PROFILE profile; first start takes a few minutes (compile + graph capture)"
 echo "endpoint: http://127.0.0.1:8000/v1  model: qwen38-27b-exl3  (ready when vLLM logs its startup-complete line)"
 exec "$HERE/vllm_plugin/run_exl3_server.sh" "$MODEL_DIR" qwen38-27b-exl3 \
-  --max-num-batched-tokens 1024 --kv-cache-dtype int8_per_token_head --mamba-ssm-cache-dtype float16 \
+  --max-num-batched-tokens 1024 --kv-cache-dtype "$KV" --mamba-ssm-cache-dtype float16 \
   "${ARGS[@]}" \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   "$@"

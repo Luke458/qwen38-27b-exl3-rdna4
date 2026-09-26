@@ -621,8 +621,8 @@ def _install_pth_prefill_dequant():
         used = bt[:, :nb]
         flat = used.reshape(-1)
         from .kv_dequant import gather_dequant
-        kd = gather_dequant(k, ks, flat, hs, q.dtype, "k")
-        vd = gather_dequant(v, vs, flat, hs, q.dtype, "v")
+        kd = gather_dequant(k, ks, flat, hs, q.dtype, "k", cap=bt.numel())
+        vd = gather_dequant(v, vs, flat, hs, q.dtype, "v", cap=bt.numel())
         key = (q.device, kd.shape[2])
         if key not in ones:
             ones[key] = torch.ones((1, 1), dtype=torch.float32, device=q.device)
@@ -634,6 +634,62 @@ def _install_pth_prefill_dequant():
 
     ta.unified_attention = unified_attention
     ta._exl3_pth_prefill = True
+
+
+def _install_kv_int4():
+    """int4_per_token_head KV: route the cache write, decode / MTP-verify attention and long prefill chunks
+    through exl3rocm.kv_int4 (same cache format). vLLM's int4 path ran its head-256 Hadamard transforms as a
+    PyTorch butterfly and an MTP verify step unsplit (38 ms per attention layer at 32k, experiments/0024).
+    Anything the kernel does not implement (sinks, ALiBi, sliding window, ...) still goes to vLLM."""
+    try:
+        from vllm.v1.attention.backend import AttentionType
+        from vllm.v1.attention.backends import triton_attn as ta
+        from vllm.v1.kv_cache_interface import KVQuantMode
+    except Exception:
+        return
+    if getattr(ta, "_exl3_kv_int4", False):
+        return
+    from . import kv_int4
+    int4 = KVQuantMode.INT4_PER_TOKEN_HEAD
+    inner = ta.unified_attention
+    thr = int(os.environ.get("EXL3_PTH_PREFILL_MIN_Q", "32"))
+    budget = int(float(os.environ.get("EXL3_PTH_PREFILL_MAX_MB", "1e9")) * 1048576)
+
+    cur = {"layer": None}  # layer whose forward is running (its calibrated means center K / V)
+
+    def unified_attention(*args, **kw):
+        if args or kw.get("kv_quant_mode") != int4 or not kv_int4.supported(kw):
+            return inner(*args, **kw)
+        if kw.get("max_seqlen_q", 0) >= thr and not torch.cuda.is_current_stream_capturing():
+            k, q, bt = kw["k"], kw["q"], kw["block_table"]
+            nb = (int(kw["max_seqlen_k"]) + k.shape[1] - 1) // k.shape[1]
+            if bt.shape[0] * nb * k.shape[1] * k.shape[2] * q.shape[-1] * 2 * q.element_size() <= budget:
+                return kv_int4.prefill(inner, kw, layer_name=cur["layer"])
+        return kv_int4.attention(**kw, layer_name=cur["layer"])
+
+    ta.unified_attention = unified_attention
+    cls = ta.TritonAttentionImpl
+    orig_update = cls.do_kv_cache_update
+    orig_forward = cls.forward
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if self._kv_quant_mode != int4 or self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return orig_update(self, layer, key, value, kv_cache, slot_mapping)
+        key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        kv_int4.reshape_and_cache(key, value, key_cache, value_cache, slot_mapping,
+                                  k_scale_cache=self._k_scale_cache, v_scale_cache=self._v_scale_cache,
+                                  layer_name=getattr(layer, "layer_name", None))
+
+    def forward(self, layer, *args, **kw):
+        cur["layer"] = getattr(layer, "layer_name", None)
+        try:
+            return orig_forward(self, layer, *args, **kw)
+        finally:
+            cur["layer"] = None
+
+    cls.do_kv_cache_update = do_kv_cache_update
+    cls.forward = forward
+    ta._exl3_kv_int4 = True
 
 
 def _install_debug_graph_timing():
@@ -756,6 +812,96 @@ def _install_kv_headroom_check():
 _KV_HEADROOM_BLOCKS = 3  # tested: 3 spare served a 32,344-token prompt at max_model_len 32768; 0 stalled
 
 
+def _install_kv_int4_emulation(which):
+    """EXL3_KV_EMU_INT4=k|v|kv (accuracy experiments only): before the per-token-head KV write,
+    round-trip K and/or V through vLLM's int4_per_token_head quantizer in torch (same RHT, asymmetric
+    4-bit, round-half-away, per token and head) and rotate back. The 8-bit cache then holds the
+    4-bit-quantized values, which measures e.g. 4-bit keys + 8-bit values without a mixed-width layout.
+    Saves no memory. EXL3_KV_EMU_CENTER=means.pt subtracts per-layer, per-head channel means before the
+    round trip and adds them back (what exact K/V centering would do). EXL3_KV_STATS=out.pt accumulates those
+    means from eager KV writes (tools/calib_kv_means.py). EXL3_KV_SAMPLES=out.pt saves each layer's first
+    2048 keys / values and the 512 queries attending to them (offline quantizer studies). experiments/0024."""
+    from vllm.v1.attention.backends import triton_attn as ta
+    from vllm.v1.attention.ops.int4_per_token_head import single_rht
+    cls = ta.TritonAttentionImpl
+    if getattr(cls, "_exl3_kv_emu", False):
+        return
+    orig = cls.do_kv_cache_update
+
+    def rnd(x):  # the int4 kernel's round-half-away-from-zero
+        return torch.where(x >= 0, torch.floor(x + 0.5), torch.ceil(x - 0.5))
+
+    def fq(x):
+        r = single_rht(x.float()).to(x.dtype).float()
+        lo, hi = r.amin(-1, keepdim=True), r.amax(-1, keepdim=True)
+        sc = ((hi - lo) / 15.0).clamp_min(1e-6)
+        zp = rnd(-lo / sc).clamp(0, 15)
+        q = rnd(r * (1.0 / sc) + zp).clamp(0, 15)
+        return (single_rht((q - zp) * sc, inverse=True) / x.shape[-1]).to(x.dtype)
+
+    means = torch.load(os.environ["EXL3_KV_EMU_CENTER"]) if os.environ.get("EXL3_KV_EMU_CENTER") else None
+    stats_path = os.environ.get("EXL3_KV_STATS")
+    stats, seen = {}, {"tokens": 0, "saved": 0}
+    dev_means = {}
+
+    def center(x, name, side):
+        if means is None or name not in means:
+            return fq(x)
+        if (name, side) not in dev_means:  # first use is eager (warmup), before graph capture
+            dev_means[(name, side)] = means[name][side].to(x.device, torch.float32)
+        mu = dev_means[(name, side)]
+        return (fq((x.float() - mu).to(x.dtype)).float() + mu).to(x.dtype)
+
+    samples_path = os.environ.get("EXL3_KV_SAMPLES")
+    samples, cur = {}, {"name": None}
+    n_samp = 2048
+
+    if samples_path:  # queries of the chunk that completes a layer's n_samp sampled keys
+        inner = ta.unified_attention
+
+        def unified_attention(*args, **kw):
+            d = samples.get(cur["name"])
+            if d is not None and "q" not in d and sum(x.shape[0] for x in d["k"]) >= n_samp:
+                d["q"] = kw["q"][-512:].half().cpu()
+                if all("q" in x for x in samples.values()) and len(samples) >= 16:
+                    torch.save({n: {"k": torch.cat(x["k"])[:n_samp], "v": torch.cat(x["v"])[:n_samp], "q": x["q"]}
+                                for n, x in samples.items()}, samples_path)
+            return inner(*args, **kw)
+
+        ta.unified_attention = unified_attention
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        name = getattr(layer, "layer_name", "")
+        cur["name"] = name
+        if samples_path and not torch.cuda.is_current_stream_capturing():
+            d = samples.setdefault(name, {"k": [], "v": []})
+            if sum(x.shape[0] for x in d["k"]) < n_samp:
+                valid = slot_mapping[: key.shape[0]] >= 0
+                d["k"].append(key[valid].half().cpu())
+                d["v"].append(value[valid].half().cpu())
+        if stats_path and not torch.cuda.is_current_stream_capturing():
+            valid = slot_mapping[: key.shape[0]] >= 0
+            st = stats.setdefault(name, {"k": 0.0, "v": 0.0, "n": 0})
+            st["k"] = st["k"] + key[valid].double().sum(0)
+            st["v"] = st["v"] + value[valid].double().sum(0)
+            st["n"] += int(valid.sum())
+            if name == min(stats):
+                seen["tokens"] += int(valid.sum())
+                if seen["tokens"] - seen["saved"] >= 2048:
+                    seen["saved"] = seen["tokens"]
+                    torch.save({n: {"k": (d["k"] / d["n"]).float().cpu(), "v": (d["v"] / d["n"]).float().cpu(),
+                                    "n": d["n"]} for n, d in stats.items() if d["n"]}, stats_path)
+        if self._is_per_token_head_quant:
+            if "k" in which:
+                key = center(key, name, "k")
+            if "v" in which:
+                value = center(value, name, "v")
+        return orig(self, layer, key, value, kv_cache, slot_mapping)
+
+    cls.do_kv_cache_update = do_kv_cache_update
+    cls._exl3_kv_emu = True
+
+
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     if os.environ.get("EXL3_DEBUG_GRAPH_TIME"):
@@ -772,6 +918,10 @@ def register():
     _install_kv_headroom_check()
     if os.environ.get("EXL3_PTH_PREFILL_DEQUANT", "1") != "0":
         _install_pth_prefill_dequant()
+    if os.environ.get("EXL3_KV_INT4", "1") != "0":
+        _install_kv_int4()
     if os.environ.get("EXL3_DEBUG_MODULE_SYNC") == "1":
         _install_debug_module_sync()
+    if os.environ.get("EXL3_KV_EMU_INT4") or os.environ.get("EXL3_KV_STATS") or os.environ.get("EXL3_KV_SAMPLES"):
+        _install_kv_int4_emulation(os.environ.get("EXL3_KV_EMU_INT4", ""))
     return None

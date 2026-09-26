@@ -14,3 +14,6 @@ exl3rocm = "exl3rocm.plugin:register"
 
 [tool.setuptools]
 packages = ["exl3rocm"]
+
+[tool.setuptools.package-data]
+exl3rocm = ["kv_means.pt"]
