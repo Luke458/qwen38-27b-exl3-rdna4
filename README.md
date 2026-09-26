@@ -2,7 +2,9 @@
 
 Fast local serving of **Qwen3.8-27B (EXL3, 11.5 GB)** on an **AMD Radeon RX 9070 XT
 (gfx1201, 16 GB)**: an OpenAI-compatible endpoint with speculative decoding, vision,
-reasoning and tool calls, all within 16 GB of VRAM.
+reasoning and tool calls, all within 16 GB of VRAM. The **Radeon AI PRO R9700 (32 GB)** is the same
+Navi 48 / gfx1201 chip, so the same build runs there, with room for up to the model's full 262k context
+(see [32 GB cards](#32-gb-cards-radeon-ai-pro-r9700)).
 
 The main route is a vLLM plugin ([`vllm_plugin/`](vllm_plugin/README.md)) that runs the
 checkpoint's trellis-quantized weights through custom gfx1201 kernels inside the community
@@ -14,6 +16,7 @@ No weights or compiled binaries are distributed here.
 |---|---:|---:|---|
 | single user (MTP-3 speculative decoding) | 32k (40k option) | **~80 tok/s** (code ~99, prose ~80) | vision loaded |
 | multi-user / long context | 64k | 42 tok/s single stream, **~200 tok/s** total at 8 streams | vision loaded |
+| R9700 32 GB, long context (MTP-3) | 128k / 262k | expected ~80 tok/s at short context | sized, not yet run on a 32 GB card |
 
 Prompt processing runs at about 1.5–1.6k tok/s, and ~1k tok/s near 32k tokens. The KV cache is int8, and its
 teacher-forced logits match an fp16 KV cache. The server peaks at 14.4–14.8 GiB of the card's 15.9 GiB, depending on the profile,
@@ -49,8 +52,9 @@ EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh ./models/qwen38-27b-exl3 q
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-Step 3 is also available as `./serve.sh`, which runs the tested profiles with the defaults above: `./serve.sh`
-(32k with MTP), `./serve.sh 40k` or `./serve.sh 64k`. It checks VRAM headroom before starting. Set `MODEL_DIR` if the
+Step 3 is also available as `./serve.sh`, which runs the profiles with the defaults above: `./serve.sh`
+(32k with MTP), `./serve.sh 40k` or `./serve.sh 64k`, and on a 32 GB card `./serve.sh 128k` or `./serve.sh 256k`.
+It checks VRAM headroom before starting. Set `MODEL_DIR` if the
 model is somewhere other than `~/models/qwen3.8-27b-exl3-11.5gb`.
 
 The build prints `source tree matches the tested build` when the fork pin and patches are the ones
@@ -76,6 +80,26 @@ and `--speculative-config` with `--max-model-len 65536 --max-num-seqs 8 --kv-cac
 The server itself peaks at about 14.4 GiB in this profile. Whatever your desktop uses comes on top of that, out of
 the card's 15.9 GiB (`rocm-smi --showmeminfo vram` shows it). For 40k context use `--max-model-len 40960
 --kv-cache-memory-bytes 2050000000` (server peak 14.8 GiB). See the [plugin README](vllm_plugin/README.md) for profiles, memory notes and the tools.
+
+## 32 GB cards (Radeon AI PRO R9700)
+
+The R9700 uses the same Navi 48 chip as the RX 9070 XT: gfx1201, 64 compute units and a 256-bit GDDR6 bus. So the
+extension build, the plugin and the image are the same, and decode speed, which is limited by memory bandwidth,
+should match (~80 tok/s with MTP, ~42 without). The extra 16 GB goes to KV cache:
+
+| `./serve.sh` profile | context | KV pool | estimated server peak |
+|---|---:|---:|---:|
+| `128k` | 131,072 | 5.25 GB | ~18,700 MiB |
+| `256k` | 262,144 (the model's maximum) | 9.9 GB | ~23,800 MiB |
+
+These are **untested**: no 32 GB card was available. The KV pools use the same page math as the measured 16 GB
+profiles (28,853,760-byte pages, with at least 3 spare so a full-length prompt cannot stall), and the peaks are
+the measured non-KV footprint plus the pool plus the prefill-time fp16 copy of the context's KV. The script
+refuses these profiles on cards with less than ~30 GB. Very long prompts are slow to read the first time: on
+current measurements, roughly 4 minutes for 128k tokens and 15 minutes for 262k (prefix caching makes follow-up
+turns fast). Decode also slows as the context fills (~60 tok/s at 40k). The plugin is single-GPU: two cards
+cannot be pooled with tensor parallelism. On a 32 GB card you can also raise `--max-num-seqs` for more concurrent
+long requests. The plugin's startup check warns if the KV pool is too small for the chosen context.
 
 ## Standalone server (original route)
 
@@ -175,7 +199,7 @@ summaries are evidence, not portable performance guarantees.
 
 ## Scope and safety
 
-- Linux and one RX 9070 XT (gfx1201). The plugin uses the `capicua25x/vllm-rocm-rdna4:0.28.0-rdna4`
+- Linux and one gfx1201 GPU: RX 9070 XT (tested) or Radeon AI PRO R9700 (same chip, untested). The plugin uses the `capicua25x/vllm-rocm-rdna4:0.28.0-rdna4`
   image (vLLM 0.28, ROCm 7.2.3). The standalone server uses Python 3.12, ROCm 7.2.4 and PyTorch 2.13.0+rocm7.2.
 - Both servers bind to loopback. A bearer key is not a substitute for TLS, access controls, or a
   hardened proxy when exposing a server remotely.

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8-27B EXL3 through the vLLM plugin with a tested profile.
+# Serve Qwen3.8-27B EXL3 through the vLLM plugin with one of its profiles (16 GB ones are measured).
 #
 #   ./serve.sh            32k context, MTP speculative decoding (~80 tok/s)   [default]
 #   ./serve.sh 40k        40k context, MTP
 #   ./serve.sh 64k        64k context, no MTP, up to 8 concurrent requests
+#   ./serve.sh 128k       128k context, MTP      (32 GB cards, e.g. Radeon AI PRO R9700; untested)
+#   ./serve.sh 256k       262k context, MTP      (32 GB cards; the model's maximum; untested)
 #   ./serve.sh 32k --generation-config vllm   extra arguments are passed to `vllm serve`
 #
 # Endpoint: http://127.0.0.1:8000/v1, model "qwen38-27b-exl3". Ctrl-C stops the server.
@@ -17,13 +19,28 @@ MODEL_DIR=${MODEL_DIR:-$HOME/models/qwen3.8-27b-exl3-11.5gb}
 export EXL3_EXT_DIR=${EXL3_EXT_DIR:-$HOME/exl3ext}
 
 MTP='{"method":"mtp","num_speculative_tokens":3}'
+MIN_TOTAL=0  # MiB of VRAM the card must have
+# 16 GB profiles: measured server peaks (experiments/0023). 32 GB profiles: KV sized with the same
+# 28,853,760-byte page math (3+ spare pages, see the plugin's KV headroom check); peaks estimated as
+# measured non-KV footprint + KV + the long-prefill fp16 KV copy. Not run on a 32 GB card yet.
 case "$PROFILE" in
   32k) PEAK=14755; ARGS=(--max-model-len 32768 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config "$MTP") ;;
   40k) PEAK=15122; ARGS=(--max-model-len 40960 --max-num-seqs 4 --kv-cache-memory-bytes 2050000000 --speculative-config "$MTP") ;;
   64k) PEAK=15171; ARGS=(--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000) ;;
-  -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  *) echo "unknown profile '$PROFILE' (use 32k, 40k or 64k)" >&2; exit 2 ;;
+  128k) PEAK=18700; MIN_TOTAL=30000; ARGS=(--max-model-len 131072 --max-num-seqs 4 --kv-cache-memory-bytes 5250000000 --speculative-config "$MTP") ;;
+  256k) PEAK=23800; MIN_TOTAL=30000; ARGS=(--max-model-len 262144 --max-num-seqs 4 --kv-cache-memory-bytes 9900000000 --speculative-config "$MTP") ;;
+  -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "unknown profile '$PROFILE' (use 32k, 40k, 64k, or on a 32 GB card 128k / 256k)" >&2; exit 2 ;;
 esac
+
+vram_mib() {  # prints "<used> <total>" in MiB, or nothing if rocm-smi is unavailable
+  command -v rocm-smi >/dev/null || return 0
+  rocm-smi --showmeminfo vram 2>/dev/null | awk '/Used Memory/ {u=$NF} /Total Memory/ {t=$NF} END {if (t) print int(u/1048576), int(t/1048576)}'
+}
+read -r USED TOTAL < <(vram_mib) || true
+if [ "$MIN_TOTAL" -gt 0 ] && [ -n "${TOTAL:-}" ] && [ "$TOTAL" -lt "$MIN_TOTAL" ]; then
+  echo "the $PROFILE profile needs a 32 GB card (this one has ${TOTAL} MiB); use 32k, 40k or 64k" >&2; exit 1
+fi
 
 [ -d "$MODEL_DIR" ] || { echo "model not found: $MODEL_DIR (set MODEL_DIR)" >&2; exit 1; }
 ls "$EXL3_EXT_DIR"/exllamav3_ext*.so >/dev/null 2>&1 || {
@@ -33,15 +50,12 @@ if podman ps --format '{{.Names}}' | grep -qx vllm-exl3; then
   echo "a vllm-exl3 server is already running; stop it with: podman stop vllm-exl3" >&2; exit 1
 fi
 
-# VRAM check: the server's measured peak plus what is already in use must fit the card
-if command -v rocm-smi >/dev/null; then
-  read -r USED TOTAL < <(rocm-smi --showmeminfo vram 2>/dev/null | awk '/Used Memory/ {u=$NF} /Total Memory/ {t=$NF} END {print int(u/1048576), int(t/1048576)}')
-  if [ -n "${USED:-}" ] && [ -n "${TOTAL:-}" ] && [ "$TOTAL" -gt 0 ]; then
-    FREE_AT_PEAK=$(( TOTAL - USED - PEAK ))
-    echo "VRAM: ${USED} MiB in use now; the $PROFILE profile peaks at ~${PEAK} MiB; ~${FREE_AT_PEAK} MiB spare at peak"
-    if [ "$FREE_AT_PEAK" -lt 150 ]; then
-      echo "warning: too little VRAM headroom for $PROFILE; close GPU-heavy apps or use a smaller profile (32k)" >&2
-    fi
+# VRAM check: the server's peak plus what is already in use must fit the card
+if [ -n "${USED:-}" ] && [ -n "${TOTAL:-}" ]; then
+  FREE_AT_PEAK=$(( TOTAL - USED - PEAK ))
+  echo "VRAM: ${USED} MiB in use now; the $PROFILE profile peaks at ~${PEAK} MiB; ~${FREE_AT_PEAK} MiB spare at peak"
+  if [ "$FREE_AT_PEAK" -lt 150 ]; then
+    echo "warning: too little VRAM headroom for $PROFILE; close GPU-heavy apps or use a smaller profile" >&2
   fi
 fi
 

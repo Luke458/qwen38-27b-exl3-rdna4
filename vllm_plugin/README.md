@@ -58,6 +58,11 @@ The 40k and 64k profiles fit with a desktop of up to ~0.9 GiB of VRAM, and the 3
 MTP 2- and 4-stream totals (111 and 124 tok/s) and the plain 2- and 4-stream totals (70 and 128 tok/s) were
 measured with the earlier 16k/2,048-batch settings, which use the same decode kernels.
 
+**32 GB cards (Radeon AI PRO R9700, same gfx1201 chip):** untested. `serve.sh` has `128k` (`--max-model-len 131072
+--kv-cache-memory-bytes 5250000000`, ~18,700 MiB estimated peak) and `256k` (`--max-model-len 262144
+--kv-cache-memory-bytes 9900000000`, ~23,800 MiB) MTP profiles, sized with the same KV page math (28,853,760-byte
+pages, at least 3 spare). See the [top-level README](../README.md#32-gb-cards-radeon-ai-pro-r9700).
+
 **Why 1,024-token batches.** Prefix caching puts vLLM's GDN state cache in "align" mode, where prefill
 chunks round down to whole 816-token KV pages. A 2,048 budget gives 1,632-token chunks and a 1,024 budget
 gives 816-token chunks. The smaller chunks cut the per-step activation peak by ~380 MiB and were also
