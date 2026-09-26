@@ -12,11 +12,12 @@ No weights or compiled binaries are distributed here.
 
 | profile | context | decode | notes |
 |---|---:|---:|---|
-| single user (MTP-3 speculative decoding) | 16k | **~80 tok/s** (code ~99, prose ~80) | vision loaded, 30k KV tokens |
-| multi-user / long context | 64k | 42 tok/s single stream, **~200 tok/s** total at 8 streams | vision loaded, 72k KV tokens |
+| single user (MTP-3 speculative decoding) | 32k (40k option) | **~80 tok/s** (code ~99, prose ~80) | vision loaded |
+| multi-user / long context | 64k | 42 tok/s single stream, **~200 tok/s** total at 8 streams | vision loaded |
 
-Prompt processing runs at about 1.3–1.9k tok/s. The KV cache is int8, and its teacher-forced
-logits match an fp16 KV cache. Measured on 2026-09-25; details are in the
+Prompt processing runs at about 1.5–1.6k tok/s, and ~1k tok/s near 32k tokens. The KV cache is int8, and its
+teacher-forced logits match an fp16 KV cache. The server peaks at 14.4–14.8 GiB of the card's 15.9 GiB, depending on the profile,
+leaving room for a desktop session on the same card. Measured on 2026-09-26; details are in the
 [plugin README](vllm_plugin/README.md).
 
 This is an experimental, narrowly tested setup: one card, one checkpoint, one GPU.
@@ -39,11 +40,11 @@ vllm_plugin/tools/build_ext_in_image.sh ~/exl3ext
 uvx --from huggingface_hub hf download GestaltLabs/Qwen3.8-27B-EXL3-11.5GB \
   --revision 0e6c4a863b945dbaf9657343fedd876c45e64dd5 --local-dir ./models/qwen38-27b-exl3
 
-# 3. serve (single-user MTP profile)
+# 3. serve (single-user MTP profile, 32k context)
 EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh ./models/qwen38-27b-exl3 qwen38-27b-exl3 \
-  --max-model-len 16384 --max-num-seqs 4 --max-num-batched-tokens 2048 \
+  --max-model-len 32768 --max-num-seqs 4 --max-num-batched-tokens 1024 \
   --kv-cache-dtype int8_per_token_head --mamba-ssm-cache-dtype float16 \
-  --kv-cache-memory-bytes 1950000000 \
+  --kv-cache-memory-bytes 1760000000 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
@@ -68,9 +69,9 @@ For the multi-user / 64k profile, replace `--max-model-len`, `--max-num-seqs`, `
 and `--speculative-config` with `--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000`.
 `EXL3_TEXT_ONLY=1` skips the vision tower. Stop the server with Ctrl-C or `podman stop vllm-exl3`.
 
-The KV sizes assume a desktop session using ~0.5 GB of VRAM; the measured peak is 15.95 of 16.3 GB. With a busier
-desktop, lower `--kv-cache-memory-bytes`. See the [plugin README](vllm_plugin/README.md) for profiles,
-memory notes and the tools.
+The server itself peaks at about 14.4 GiB in this profile. Whatever your desktop uses comes on top of that, out of
+the card's 15.9 GiB (`rocm-smi --showmeminfo vram` shows it). For 40k context use `--max-model-len 40960
+--kv-cache-memory-bytes 2050000000` (server peak 14.8 GiB). See the [plugin README](vllm_plugin/README.md) for profiles, memory notes and the tools.
 
 ## Standalone server (original route)
 

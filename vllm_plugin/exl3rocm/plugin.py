@@ -333,6 +333,9 @@ class Exl3LinearMethod(LinearMethodBase):
         assert not missing, f"exl3rocm: missing tensors {missing}"
         layer.exl3_is_mul1 = layer.exl3_mul1 is not None
         layer.exl3_is_mcg = layer.exl3_mcg is not None
+        if isinstance(layer, ParallelLMHead) and self._drafting:
+            _split_lm_head_for_draft(layer)
+            ng = len(layer.exl3_n)
         from .ops import reserve_weight_buffer
         k = layer.exl3_trellis_0.shape[0] * 16
         dev = layer.exl3_trellis_0.device
@@ -347,8 +350,6 @@ class Exl3LinearMethod(LinearMethodBase):
                 layer.register_buffer(f"exl3_ptrs_{kind}", t, persistent=False)
                 return t
             layer.exl3_mgemm_ptrs = [ptrs("trellis"), ptrs("suh"), ptrs("svh")]
-        if isinstance(layer, ParallelLMHead) and self._drafting:
-            _build_draft_head(layer)
         # drop the 0-size load targets so nothing downstream mistakes them for weights
         for name in ("trellis", "suh", "svh", "mul1", "mcg"):
             if name in layer._parameters:
@@ -437,25 +438,52 @@ def _draft_blocks(n_blocks_total: int) -> list[int]:
     return sorted(set(range(n)) | set(range(max(n, n_blocks_total - 16), n_blocks_total)))
 
 
-def _build_draft_head(layer):
-    """Pruned copy of the lm_head for the MTP drafter (target verification keeps the full head,
-    so generated text is unchanged; only draft acceptance can drop). Adapted from exl3xpu."""
+def _split_lm_head_for_draft(layer):
+    """Pruned MTP draft head without a copy (was 0.20 GiB): store the lm_head as three column
+    groups, [drafted prefix | middle | drafted tail]. The target's full head runs all three
+    (concatenated in order inside linear_groups, so logits keep their column order); the drafter
+    runs groups 0 and 2 only. Target verification keeps the full head, so generated text is
+    unchanged; only draft acceptance can drop. Pruning adapted from exl3xpu."""
     if len(layer.exl3_n) != 1:
         return
     n = layer.exl3_n[0]
     blocks = _draft_blocks(n // 128)
     if not blocks:
         return
-    dev = layer.exl3_trellis_0.device
-    b = torch.tensor(blocks, dtype=torch.long, device=dev)
-    tiles = (b[:, None] * 8 + torch.arange(8, device=dev)[None, :]).flatten()
-    cols = (b[:, None] * 128 + torch.arange(128, device=dev)[None, :]).flatten()
-    layer.register_buffer("exl3_draft_trellis", layer.exl3_trellis_0.index_select(1, tiles).contiguous(),
-                          persistent=False)
-    layer.register_buffer("exl3_draft_svh", layer.exl3_svh_0.index_select(0, cols).contiguous(), persistent=False)
-    layer.register_buffer("exl3_draft_cols", cols, persistent=False)
-    logger.info("exl3rocm: MTP draft head scores %d of %d vocab blocks (%.1f%%)", len(blocks), n // 128,
-                100.0 * len(blocks) / (n // 128))
+    nb = n // 128
+    p = next((i for i, blk in enumerate(blocks) if blk != i), len(blocks))  # prefix blocks [0, p)
+    if p == 0 or p == len(blocks) or blocks[p:] != list(range(blocks[p], nb)):
+        return
+    a, b = 128 * p, 128 * blocks[p]  # drafted columns: [0, a) and [b, n)
+    K, t, su, sv = layer.exl3_K[0], layer.exl3_trellis_0, layer.exl3_suh_0, layer.exl3_svh_0
+    bounds = [0, a, b, n]
+    parts = [(t[:, bounds[i] // 16:bounds[i + 1] // 16].contiguous(), sv[bounds[i]:bounds[i + 1]].contiguous())
+             for i in range(3)]
+    for name in ("exl3_trellis_0", "exl3_svh_0"):
+        del layer._buffers[name]
+    del t, sv
+    for i, (ti, svi) in enumerate(parts):
+        layer.register_buffer(f"exl3_trellis_{i}", ti, persistent=False)
+        layer.register_buffer(f"exl3_suh_{i}", su, persistent=False)
+        layer.register_buffer(f"exl3_svh_{i}", svi, persistent=False)
+    del parts
+    layer.exl3_K = [K] * 3
+    layer.exl3_n = [a, b - a, n - b]
+    layer.exl3_draft_groups = (0, 2)
+    dev = su.device
+    layer.register_buffer("exl3_draft_cols", torch.cat([torch.arange(0, a, device=dev),
+                                                        torch.arange(b, n, device=dev)]), persistent=False)
+    if not torch.cuda.is_current_stream_capturing():
+        torch.cuda.empty_cache()
+    logger.info("exl3rocm: MTP draft head scores %d of %d vocab blocks (%.1f%%), no copy",
+                (a + n - b) // 128, n // 128, 100.0 * (a + n - b) / n)
+
+
+def _draft_logits(lm, hidden_states):
+    gs = lm.exl3_draft_groups
+    return torch.ops.exl3rocm.linear_groups(
+        hidden_states, [getattr(lm, f"exl3_trellis_{g}") for g in gs], [getattr(lm, f"exl3_suh_{g}") for g in gs],
+        [getattr(lm, f"exl3_svh_{g}") for g in gs], [lm.exl3_K[g] for g in gs], lm.exl3_is_mcg, lm.exl3_is_mul1)
 
 
 def _install_draft_logits_patch():
@@ -470,12 +498,11 @@ def _install_draft_logits_patch():
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         lm = self.lm_head
-        if getattr(lm, "exl3_draft_trellis", None) is None:
+        if getattr(lm, "exl3_draft_groups", None) is None:
             return orig(self, hidden_states, spec_step_idx)
         from . import ops  # noqa: F401
-        sub = torch.ops.exl3rocm.linear(hidden_states, lm.exl3_draft_trellis, lm.exl3_suh_0, lm.exl3_draft_svh,
-                                        lm.exl3_K[0], lm.exl3_is_mcg, lm.exl3_is_mul1)
-        logits = sub.new_full((sub.shape[0], lm.exl3_n[0]), float("-inf"))
+        sub = _draft_logits(lm, hidden_states)
+        logits = sub.new_full((sub.shape[0], sum(lm.exl3_n)), float("-inf"))
         logits.index_copy_(1, lm.exl3_draft_cols, sub)
         return logits[:, : self.config.vocab_size].to(hidden_states.dtype)
 
@@ -487,11 +514,10 @@ def _install_draft_logits_patch():
 
     def get_top_tokens(self, hidden_states):
         lm = self.lm_head
-        if getattr(lm, "exl3_draft_trellis", None) is None or orig_top is None:
+        if getattr(lm, "exl3_draft_groups", None) is None or orig_top is None:
             return orig_top(self, hidden_states)
         from . import ops  # noqa: F401
-        sub = torch.ops.exl3rocm.linear(hidden_states, lm.exl3_draft_trellis, lm.exl3_suh_0, lm.exl3_draft_svh,
-                                        lm.exl3_K[0], lm.exl3_is_mcg, lm.exl3_is_mul1)
+        sub = _draft_logits(lm, hidden_states)
         vocab = self.config.vocab_size
         cols = lm.exl3_draft_cols
         sub = sub.masked_fill((cols >= vocab)[None, :], float("-inf"))
@@ -636,6 +662,88 @@ def _install_debug_graph_timing():
     torch.cuda.CUDAGraph.replay = replay
 
 
+def _install_rope_clamp():
+    """Qwen3.5 sizes its rotary cos/sin cache by config.max_position_embeddings (262,144 rows,
+    0.125 GiB) whatever max_model_len is. For plain rope and mrope ("default" rope type, no
+    dual-chunk attention) the cache is only indexed by position, and positions stay below the
+    sequence length, so clamp it to max_model_len plus a margin. Scaled rope types are untouched."""
+    import sys
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.model_executor.layers import rotary_embedding
+    orig = rotary_embedding.get_rope
+    if getattr(orig, "_exl3_clamped", False):
+        return
+
+    def get_rope(head_size, max_position, *args, **kwargs):
+        cfg = get_current_vllm_config_or_none()
+        rp = kwargs.get("rope_parameters") or {}
+        if (cfg is not None and isinstance(getattr(cfg, "quant_config", None), Exl3Config)
+                and kwargs.get("dual_chunk_attention_config") is None and not args
+                and rp.get("rope_type", "default") == "default" and not rp.get("use_fope")):
+            cap = cfg.model_config.max_model_len + 4096
+            if max_position > cap:
+                max_position = cap
+        return orig(head_size, max_position, *args, **kwargs)
+
+    get_rope._exl3_clamped = True
+    rotary_embedding.get_rope = get_rope
+    # model modules imported before this hook hold their own reference
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "get_rope", None) is orig and mod is not rotary_embedding:
+            mod.get_rope = get_rope
+
+
+def _install_kv_headroom_check():
+    """vLLM 0.28 sizes a hybrid (GDN) model's KV pool so exactly one max_model_len request fits,
+    counting 2 + num_speculative_blocks mamba pages per group in "align" mode (the default with
+    prefix caching). In practice a prompt near max_model_len needed ~3 more pages: with MTP-3 at
+    max_model_len 32768 and a 1.65 GB pool, a 31.5k-token prompt stalled forever at 94.6% KV
+    usage with nothing to preempt (experiments/0023). Warn at startup when the pool leaves fewer
+    than _KV_HEADROOM_BLOCKS spare pages, with the KV size or context length that would fit."""
+    import sys
+    from vllm.v1.core import kv_cache_utils
+    orig = kv_cache_utils.update_kv_cache_capacity
+    if getattr(orig, "_exl3_wrapped", False):
+        return
+
+    def update_kv_cache_capacity(vllm_config, kv_cache_config):
+        orig(vllm_config, kv_cache_config)
+        try:
+            from vllm.utils.math_utils import cdiv
+            from vllm.v1.kv_cache_interface import MambaSpec
+            groups = kv_cache_config.kv_cache_groups
+            if not any(isinstance(g.kv_cache_spec, MambaSpec) for g in groups):
+                return
+            per_req = sum(cdiv(g.kv_cache_spec.max_memory_usage_bytes(vllm_config), g.kv_cache_spec.page_size_bytes)
+                          for g in groups)
+            spare = kv_cache_config.num_blocks - 1 - per_req  # block 0 is the null block
+            if spare >= _KV_HEADROOM_BLOCKS:
+                return
+            short = _KV_HEADROOM_BLOCKS - spare
+            bsz = min(g.kv_cache_spec.block_size for g in groups if not isinstance(g.kv_cache_spec, MambaSpec))
+            fit_len = vllm_config.model_config.max_model_len - short * bsz
+            try:
+                extra = f"about {short * kv_cache_utils._pool_bytes_per_block(vllm_config, groups):,} more bytes of " \
+                        "--kv-cache-memory-bytes"
+            except Exception:
+                extra = f"{short} more KV blocks"
+            logger.warning(
+                "exl3rocm: the KV pool holds one max_model_len request with only %d spare blocks (%d-token "
+                "pages); vLLM can stall a prompt near max_model_len indefinitely in this state. Use %s, or "
+                "--max-model-len %d or less.", max(spare, 0), bsz, extra, max(fit_len, bsz))
+        except Exception as e:  # never block startup on a diagnostic
+            logger.debug("exl3rocm: KV headroom check skipped: %s", e)
+
+    update_kv_cache_capacity._exl3_wrapped = True
+    kv_cache_utils.update_kv_cache_capacity = update_kv_cache_capacity
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "update_kv_cache_capacity", None) is orig and mod is not kv_cache_utils:
+            mod.update_kv_cache_capacity = update_kv_cache_capacity
+
+
+_KV_HEADROOM_BLOCKS = 3  # tested: 3 spare served a 32,344-token prompt at max_model_len 32768; 0 stalled
+
+
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     if os.environ.get("EXL3_DEBUG_GRAPH_TIME"):
@@ -647,6 +755,9 @@ def register():
     if os.environ.get("EXL3_DRAFT_VOCAB_BLOCKS", "640") != "0":
         _install_draft_logits_patch()
     _install_drafter_placeholder_hook()
+    if os.environ.get("EXL3_ROPE_CLAMP", "1") != "0":
+        _install_rope_clamp()
+    _install_kv_headroom_check()
     if os.environ.get("EXL3_PTH_PREFILL_DEQUANT", "1") != "0":
         _install_pth_prefill_dequant()
     if os.environ.get("EXL3_DEBUG_MODULE_SYNC") == "1":

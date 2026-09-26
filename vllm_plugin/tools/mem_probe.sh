@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Start the EXL3 server with the given args, then report: model-load memory, KV capacity, VRAM after
 # startup, and peak VRAM under a stress load (long prompt, one image, 4 concurrent streams).
+# Whole-card numbers include the desktop's VRAM, which varies (0.47-0.8 GB seen here), so the
+# baseline is measured first and the server's own share (peak - baseline) is reported as well.
 #   EXL3_EXT_DIR=... mem_probe.sh NAME [vllm serve args...]
 set -uo pipefail
 HERE=$(dirname "$(realpath "$0")"); ROOT=$(dirname "$HERE"); REPO=$(dirname "$ROOT")
 NAME=$1; shift
 LOG=${MEM_PROBE_LOGDIR:-/tmp}/server_$NAME.log
 podman rm -f vllm-exl3 >/dev/null 2>&1
+vram() { rocm-smi --showmeminfo vram 2>/dev/null | grep -oE "Used Memory \(B\): [0-9]+" | grep -oE "[0-9]+$"; }
+sleep 2; BASE=$(vram)
 ("$ROOT/run_exl3_server.sh" "${MODEL_DIR:-$HOME/models/qwen3.8-27b-exl3-11.5gb}" qwen38-27b-exl3 "$@" > "$LOG" 2>&1 &)
 sleep 8
 for i in $(seq 1 1500); do
@@ -14,11 +18,11 @@ for i in $(seq 1 1500); do
   podman ps --format '{{.Names}}' | grep -q vllm-exl3 || break
   sleep 1
 done
-vram() { rocm-smi --showmeminfo vram 2>/dev/null | grep -oE "Used Memory \(B\): [0-9]+" | grep -oE "[0-9]+$"; }
 echo "== $NAME"
+echo "desktop baseline: $(( BASE / 1048576 )) MiB"
 grep -oE "Model loading took [0-9.]+ GiB|GPU KV cache size: [0-9,]+ tokens|ValueError: [^.]*" "$LOG" | head -3
 if ! grep -q "Application startup complete" "$LOG"; then echo "STARTUP FAILED"; exit 1; fi
-echo "VRAM after startup: $(( $(vram) / 1048576 )) MiB"
+V=$(vram); echo "VRAM after startup: $(( V / 1048576 )) MiB (server $(( (V - BASE) / 1048576 )) MiB)"
 PEAK=0
 ( while true; do v=$(vram); echo "$v"; sleep 0.2; done ) > /tmp/mem_probe_samples.$$ &
 SAMPLER=$!
@@ -39,5 +43,5 @@ fi
 python3 "$HERE/concurrency_bench.py" --model qwen38-27b-exl3 --conc 4 --max-tokens 128 2>&1 | tail -1
 kill $SAMPLER 2>/dev/null
 PEAK=$(sort -n /tmp/mem_probe_samples.$$ | tail -1); rm -f /tmp/mem_probe_samples.$$
-echo "VRAM peak under stress: $(( PEAK / 1048576 )) MiB (card total 16304 MiB)"
+echo "VRAM peak under stress: $(( PEAK / 1048576 )) MiB of 16304 (server $(( (PEAK - BASE) / 1048576 )) MiB)"
 grep -qE "Memory access fault|OutOfMemory|out of memory" "$LOG" && echo "FAULT/OOM IN LOG"

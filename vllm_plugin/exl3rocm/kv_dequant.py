@@ -2,7 +2,7 @@
 
 Used by the long-prefill attention path (plugin._install_pth_prefill_dequant). One Triton program
 per (selected block, slot, kv head) row: out[j, s, h, :] = src[blk[j], s, h, :hs] * scale[blk[j], s, h].
-The output buffer is persistent and grows in 1.25x steps, so repeated prefill chunks with growing
+The output buffer is persistent and grows in 1.25x steps (capped at the KV pool's block count), so repeated prefill chunks with growing
 context do not ratchet the caching allocator (a fresh torch allocation per chunk did: +650 MiB peak
 at a 50k-token prompt, experiments/0022).
 """
@@ -34,12 +34,13 @@ def _pth_dequant_kernel(src, scale, blk, out,
 _bufs: dict = {}
 
 
-def _buffer(tag, device, nb, bsz, nkv, hs, dtype):
+def _buffer(tag, device, nb, bsz, nkv, hs, dtype, cap):
     key = (tag, device, bsz, nkv, hs, dtype)
     buf = _bufs.get(key)
     if buf is None or buf.shape[0] < nb:
         grow = max(nb, int((buf.shape[0] if buf is not None else 0) * 1.25) + 1)
-        grow = (grow + 3) // 4 * 4
+        # never beyond the KV pool: a prefill cannot reference more blocks than exist
+        grow = min(max((grow + 3) // 4 * 4, nb), max(cap, nb))
         _bufs.pop(key, None)
         if buf is not None:
             # hand the old segment back to the driver before allocating the larger one; otherwise
@@ -60,7 +61,7 @@ def gather_dequant(src: torch.Tensor, scale: torch.Tensor, blocks: torch.Tensor,
     Returns [n, block_size, nkv, hs] fp16 (a view of a persistent buffer)."""
     n = blocks.numel()
     _, bsz, nkv, _ = src.shape
-    out = _buffer(tag, src.device, n, bsz, nkv, hs, dtype)
+    out = _buffer(tag, src.device, n, bsz, nkv, hs, dtype, src.shape[0])
     assert src.stride(-1) == 1
     _pth_dequant_kernel[(n, bsz, nkv)](
         src, scale, blocks, out,
