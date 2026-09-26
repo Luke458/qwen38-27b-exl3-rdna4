@@ -101,6 +101,25 @@ turns fast). Decode also slows as the context fills (~60 tok/s at 40k). The plug
 cannot be pooled with tensor parallelism. On a 32 GB card you can also raise `--max-num-seqs` for more concurrent
 long requests. The plugin's startup check warns if the KV pool is too small for the chosen context.
 
+### Higher-bitrate quants on 32 GB
+
+A 32 GB card can also hold less-quantized versions of the model. turboderp's official
+[Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3) has `4.00bpw`, `5.00bpw` and `6.00bpw` branches.
+They use the same `mul1` codebook as the tested checkpoint (which averages ~2.9 bpw in its decoder layers) and
+include the MTP head. They are **untested** here; the estimates below scale the measured speed by weight size:
+
+| branch | download | context that fits (est.) | decode without / with MTP (est.) |
+|---|---:|---|---:|
+| `4.00bpw` | 15.7 GiB | full 262k | ~31 / ~58 tok/s |
+| `5.00bpw` | 18.5 GiB | ~128k (262k marginal) | ~25 / ~48 tok/s |
+| `6.00bpw` | 21.4 GiB | ~128k | ~21 / ~40 tok/s |
+
+4.0 bpw is likely the best balance: a clear quality step up from ~3 bpw, still fast, and full context. These
+quants keep the input embedding in bf16 (2.4 GiB on the GPU, vs 1.2 GiB for the tested checkpoint's fp8 table)
+and the vision tower unquantized; the plugin handles both. The `serve.sh` profiles are sized for the tested
+checkpoint, so for these run `MODEL_DIR=... ./serve.sh 128k` and adjust `--kv-cache-memory-bytes` if needed
+(the plugin warns at startup when the pool is too small for the context). None of them fit on a 16 GB card.
+
 ## Standalone server (original route)
 
 The original server (`tools/serve.py`) runs the same checkpoint directly on the ROCm fork's
