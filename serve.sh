@@ -27,13 +27,14 @@ MIN_TOTAL=0  # MiB of VRAM the card must have
 # 28,853,760-byte page math (3+ spare pages, see the plugin's KV headroom check); peaks estimated as
 # measured non-KV footprint + KV + the long-prefill fp16 KV copy. Not run on a 32 GB card yet.
 # int4 profiles (experiments/0024): 1,616-token pages of 29,010,432 bytes, 3+ spare. 48k-int4 peaked at
-# 14,665 MiB with a 41k prompt and an image; 64k-int4 at 14.5-14.8 GiB text-only at 53-62k, so ~15.2 GiB with
-# vision (estimated: a full-length vision run did not fit next to a 1.1 GiB desktop).
+# 14,665 MiB with a 41k prompt and an image before the exact sink / tail rows (+~0.1 GiB); 64k-int4 at
+# 14.5-14.8 GiB text-only at 53-62k, so ~15.3 GiB with vision and exact rows (estimated: a full-length vision
+# run did not fit next to a 1.1 GiB desktop).
 case "$PROFILE" in
   32k) PEAK=14755; ARGS=(--max-model-len 32768 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config "$MTP") ;;
   40k) PEAK=15122; ARGS=(--max-model-len 40960 --max-num-seqs 4 --kv-cache-memory-bytes 2050000000 --speculative-config "$MTP") ;;
-  48k-int4) PEAK=14700; KV=int4_per_token_head; ARGS=(--max-model-len 49152 --max-num-seqs 4 --kv-cache-memory-bytes 1460000000 --speculative-config "$MTP") ;;
-  64k-int4) PEAK=15200; KV=int4_per_token_head; ARGS=(--max-model-len 65536 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config "$MTP") ;;
+  48k-int4) PEAK=14800; KV=int4_per_token_head; ARGS=(--max-model-len 49152 --max-num-seqs 4 --kv-cache-memory-bytes 1460000000 --speculative-config "$MTP") ;;
+  64k-int4) PEAK=15300; KV=int4_per_token_head; ARGS=(--max-model-len 65536 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config "$MTP") ;;
   64k) PEAK=15171; ARGS=(--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000) ;;
   128k) PEAK=18700; MIN_TOTAL=30000; ARGS=(--max-model-len 131072 --max-num-seqs 4 --kv-cache-memory-bytes 5250000000 --speculative-config "$MTP") ;;
   256k) PEAK=23800; MIN_TOTAL=30000; ARGS=(--max-model-len 262144 --max-num-seqs 4 --kv-cache-memory-bytes 9900000000 --speculative-config "$MTP") ;;

@@ -52,5 +52,10 @@ SOFTWARE.
 project, licensed under the Apache License 2.0
 (https://www.apache.org/licenses/LICENSE-2.0). The changes are the GDN metadata
 mask-index fix and one metadata build per step shared across GDN layers; the
-`.patch` files next to it show the exact differences. The plugin otherwise only
-imports vLLM at runtime and does not redistribute it.
+`.patch` files next to it show the exact differences.
+
+`vllm_plugin/exl3rocm/kv_int4.py` uses the cache format of vLLM 0.28.0's
+`vllm/v1/attention/ops/int4_per_token_head.py` and adapts its attention kernel (`_attn_packed`, same
+copyright and license): the nibble layout, zero-point-in-scale encoding, randomized Hadamard sign vector and
+the split-KV / online-softmax structure come from it. The plugin otherwise only imports vLLM at runtime and
+does not redistribute it.

@@ -34,7 +34,7 @@ Status: experimental. It has been tested only with the GestaltLabs Qwen3.8-27B E
 
 ## Quick start
 
-See the [top-level quickstart](../README.md#quickstart-vllm-plugin) for the full commands. In short:
+See the [top-level quickstart](../README.md#quickstart) for the full commands. In short:
 
 ```bash
 vllm_plugin/tools/build_ext_in_image.sh ~/models/exl3ext        # fresh pinned fork + patches, built in the image
@@ -56,8 +56,8 @@ desktop's VRAM comes on top of it, and the card has 16,304 MiB, so keep the tota
 | **single user, MTP-3, 32k** | `--max-model-len 32768 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 35,108 | **14,755 MiB** | **~80 tok/s** (prose 80 / code 99 / story 65) | 32k tokens at 1.0k tok/s |
 | single user, MTP-3, 40k | same with `--max-model-len 40960 --kv-cache-memory-bytes 2050000000` | 44,063 | 15,122 MiB | ~78 tok/s | 40k tokens at 0.95k tok/s |
 | multi-user / long context | `--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000` | 72,238 | 15,171 MiB | 42 tok/s; **199 tok/s** total at 8 streams | 60k tokens at 0.83k tok/s |
-| **4-bit KV, MTP-3, 48k** | 32k's MTP flags with `--kv-cache-dtype int4_per_token_head --max-model-len 49152 --kv-cache-memory-bytes 1460000000` | 53,426 | 14,665 MiB (41k prompt + image) | ~80 tok/s; 72 at 41k | 41k tokens at 0.96k tok/s |
-| **4-bit KV, MTP-3, 64k** | same with `--max-model-len 65536 --kv-cache-memory-bytes 1760000000` | 70,217 | 14.5–14.8 GiB text-only at 53–62k; ~15.1–15.3 GiB with vision (est.) | ~80 tok/s; 63–68 at 53–62k | 61.8k tokens at 0.78k tok/s |
+| **4-bit KV, MTP-3, 48k** | 32k's MTP flags with `--kv-cache-dtype int4_per_token_head --max-model-len 49152 --kv-cache-memory-bytes 1460000000` | 53,426 | ~14,800 MiB (14,665 at a 41k prompt + image before the exact rows) | ~80 tok/s; 72 at 41k | 41k tokens at 0.96k tok/s |
+| **4-bit KV, MTP-3, 64k** | same with `--max-model-len 65536 --kv-cache-memory-bytes 1760000000` | 70,217 | 14.5–14.8 GiB text-only at 53–62k; ~15,300 MiB with vision (est.) | ~80 tok/s; 63–68 at 53–62k | 61.8k tokens at 0.78k tok/s |
 
 The 40k and 64k profiles fit with a desktop of up to ~0.9 GiB of VRAM, and the 32k profile with up to ~1.3 GiB. The
 MTP 2- and 4-stream totals (111 and 124 tok/s) and the plain 2- and 4-stream totals (70 and 128 tok/s) were
