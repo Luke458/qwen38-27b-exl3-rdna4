@@ -539,6 +539,18 @@ def _visual_qkv_stream(weights):
     attribute and drop the bf16 weight; the per-matrix fp16 biases are dropped in favour of the
     fused bias. EXL3_VISION_QKV_BF16=1: keep the bf16 fused weight, drop the EXL3 copies."""
     bf16 = os.environ.get("EXL3_VISION_QKV_BF16") == "1"
+    # checkpoints whose vision tower is not EXL3 (e.g. turboderp's uniform-bpw quants) only have
+    # the bf16 fused weight: pass everything through untouched
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+        cfg = get_current_vllm_config_or_none()
+        qc = getattr(cfg, "quant_config", None) if cfg is not None else None
+        if isinstance(qc, Exl3Config) and not any(k.startswith("visual.") and k.endswith("attn.q_proj")
+                                                  for k in qc.modules):
+            yield from weights
+            return
+    except Exception:
+        pass
     for n, w in weights:
         m = _VISUAL_QKV_SPLIT.search(n)
         if m:
