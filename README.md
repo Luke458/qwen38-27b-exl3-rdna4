@@ -49,6 +49,10 @@ EXL3_EXT_DIR=~/exl3ext vllm_plugin/run_exl3_server.sh ./models/qwen38-27b-exl3 q
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
+Step 3 is also available as `./serve.sh`, which runs the tested profiles with the defaults above: `./serve.sh`
+(32k with MTP), `./serve.sh 40k` or `./serve.sh 64k`. It checks VRAM headroom before starting. Set `MODEL_DIR` if the
+model is somewhere other than `~/models/qwen3.8-27b-exl3-11.5gb`.
+
 The build prints `source tree matches the tested build` when the fork pin and patches are the ones
 that were measured. The first start compiles and captures graphs for a few minutes, and later starts reuse
 `~/.cache/vllm-rdna4-exl3`. When the log shows `Application startup complete`, the endpoint is
