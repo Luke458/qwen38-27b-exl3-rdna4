@@ -20,6 +20,9 @@ IMAGE=docker.io/capicua25x/vllm-rocm-rdna4:0.28.0-rdna4
 CACHE_DIR="$HOME/.cache/vllm-rdna4-exl3"
 [ "${EXL3_TEXT_ONLY:-0}" = "1" ] && CACHE_DIR="$HOME/.cache/vllm-rdna4-exl3-textonly"
 mkdir -p "$CACHE_DIR"
+# Triton's kernel cache lives in the same directory (TRITON_CACHE_DIR below). Otherwise every start recompiles
+# the Triton kernels, and the first long prompt after a start paid ~1.2 s to compile its prefill attention
+# variant (experiments/0027)
 ARGS=$(printf ' %q' "$@")
 # forward every EXL3_* tuning/debug variable into the container
 ENV_FWD=""
@@ -44,6 +47,7 @@ exec podman run --rm --name vllm-exl3 \
   -v "$CACHE_DIR":/root/.cache/vllm \
   $GDN_MOUNT ${EXTRA_MOUNTS:-} $ENV_FWD \
   -e PYTHONPATH=/exl3ext -e GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-1} \
+  -e TRITON_CACHE_DIR=/root/.cache/vllm/triton \
   -e VLLM_USE_V2_MODEL_RUNNER=${EXL3_V2_RUNNER:-1} \
   -e EXL3_GEMV_FUSED_HAD=${EXL3_GEMV_FUSED_HAD:-1} \
   --entrypoint bash "$IMAGE" -c "

@@ -10,9 +10,32 @@ fresh torch allocation per chunk did: +650 MiB peak at a 50k-token prompt, exper
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+# Tiling for the fp16 prefill attention call both paths end in. For head size 256 the image picks BLOCK_M 16
+# on gfx1201, i.e. 2 query tokens per program with 6 query heads per KV head, so an 816-token chunk re-reads
+# its whole context ~400 times. BLOCK_M 128 / 8 warps / 2 stages (KV tile stays 32) is 2.2x faster at 16-32k
+# context with bit-identical output (experiments/0027). The image reads these knobs on every call, so they are
+# set around the prefill call only; decode and MTP verify keep their tiling. A knob set by the user wins, and
+# EXL3_PREFILL_TILING=0 turns this off.
+_TILING = {"VLLM_RDNA_BLOCK_M": "128", "VLLM_RDNA_WARPS": "8", "VLLM_RDNA_STAGES": "2"}
+_tiling_on = os.environ.get("EXL3_PREFILL_TILING", "1") != "0"
+
+
+def prefill_attention(orig, **kw):
+    """orig(**kw) with the prefill tiling above."""
+    set_ = [k for k in _TILING if k not in os.environ] if _tiling_on else []
+    for k in set_:
+        os.environ[k] = _TILING[k]
+    try:
+        return orig(**kw)
+    finally:
+        for k in set_:
+            os.environ.pop(k, None)
 
 
 @triton.jit

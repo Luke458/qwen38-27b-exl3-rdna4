@@ -592,7 +592,7 @@ def prefill(orig, kw, layer_name: str | None = None):
     run vLLM's fp16 kernel (orig) with a rotated q, un-rotate the output. q.k and p.v are unchanged."""
     from vllm.v1.kv_cache_interface import KVQuantMode
 
-    from .kv_dequant import gather_dequant_int4
+    from .kv_dequant import gather_dequant_int4, prefill_attention
     q, k, v, bt, out = kw["q"], kw["k"], kw["v"], kw["block_table"], kw["out"]
     d = q.shape[-1]
     mats = rht_matrices(d, q.device)
@@ -614,7 +614,8 @@ def prefill(orig, kw, layer_name: str | None = None):
         _ones[q.device] = torch.ones((1, 1), dtype=torch.float32, device=q.device)
     desc = _ones[q.device].expand(bt.shape[0], kd.shape[2])
     rot = torch.empty_like(q)
-    orig(**dict(kw, q=rotate(q, mats["fwd_n"]), k=kd, v=vd, out=rot, kv_quant_mode=KVQuantMode.NONE,
-                k_scale_cache=None, v_scale_cache=None, k_descale=desc, v_descale=desc,
-                block_table=torch.arange(flat.numel(), device=bt.device, dtype=bt.dtype).view(used.shape)))
+    prefill_attention(orig, **dict(kw, q=rotate(q, mats["fwd_n"]), k=kd, v=vd, out=rot, kv_quant_mode=KVQuantMode.NONE,
+                                   k_scale_cache=None, v_scale_cache=None, k_descale=desc, v_descale=desc,
+                                   block_table=torch.arange(flat.numel(), device=bt.device,
+                                                            dtype=bt.dtype).view(used.shape)))
     rotate(rot, mats["inv_n"], out=out, bias=_out_bias(layer_bias(layer_name, k.shape[2], d, q.device), q.shape[1]))

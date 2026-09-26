@@ -53,13 +53,16 @@ desktop's VRAM comes on top of it, and the card has 16,304 MiB, so keep the tota
 
 | profile | extra flags | KV tokens | server peak | decode | long prompt |
 |---|---|---:|---:|---|---|
-| **single user, MTP-3, 32k** | `--max-model-len 32768 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 35,108 | **14,755 MiB** | **~80 tok/s** (prose 80 / code 99 / story 65) | 32k tokens at 1.0k tok/s |
+| **single user, MTP-3, 32k** | `--max-model-len 32768 --max-num-seqs 4 --kv-cache-memory-bytes 1760000000 --speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 35,108 | **14,755 MiB** | **~80 tok/s** (prose 80 / code 99 / story 65) | 27k tokens at 1.3k tok/s |
 | single user, MTP-3, 40k | same with `--max-model-len 40960 --kv-cache-memory-bytes 2050000000` | 44,063 | 15,122 MiB | ~78 tok/s | 40k tokens at 0.95k tok/s |
 | multi-user / long context | `--max-model-len 65536 --max-num-seqs 8 --kv-cache-memory-bytes 2600000000` | 72,238 | 15,171 MiB | 42 tok/s; **199 tok/s** total at 8 streams | 60k tokens at 0.83k tok/s |
 | **4-bit KV, MTP-3, 48k** | 32k's MTP flags with `--kv-cache-dtype int4_per_token_head --max-model-len 49152 --kv-cache-memory-bytes 1460000000` | 53,426 | ~14,800 MiB (14,665 at a 41k prompt + image before the exact rows) | ~80 tok/s; 72 at 41k | 41k tokens at 0.96k tok/s |
-| **4-bit KV, MTP-3, 64k** | same with `--max-model-len 65536 --kv-cache-memory-bytes 1760000000` | 70,217 | 14.5–14.8 GiB text-only at 53–62k; ~15,300 MiB with vision (est.) | ~80 tok/s; 63–68 at 53–62k | 61.8k tokens at 0.78k tok/s |
+| **4-bit KV, MTP-3, 64k** | same with `--max-model-len 65536 --kv-cache-memory-bytes 1760000000` | 70,217 | 14.5–14.8 GiB text-only at 53–62k; ~15,300 MiB with vision (est.) | ~80 tok/s; 63–68 at 53–62k | 51k tokens at 1.16k tok/s; 61k at 1.1k |
 
-The 40k and 64k profiles fit with a desktop of up to ~0.9 GiB of VRAM, and the 32k profile with up to ~1.3 GiB. The
+The 40k and 64k profiles fit with a desktop of up to ~0.9 GiB of VRAM, and the 32k profile with up to ~1.3 GiB.
+The long-prompt figures of the 40k, 64k and 48k-int4 rows were measured before the prefill attention tiling
+(see "KV cache" below), which made 27k-token prompts 1.2x and 51–61k-token prompts 1.35x faster; the
+61k figure is offline without MTP. The
 MTP 2- and 4-stream totals (111 and 124 tok/s) and the plain 2- and 4-stream totals (70 and 128 tok/s) were
 measured with the earlier 16k/2,048-batch settings, which use the same decode kernels.
 
@@ -82,8 +85,15 @@ prompt near max-model-len needs a few more pages. With none spare, a 31.5k promp
 (KL 0.0018 vs 0.0055 on the decode path, both 128/128 top-1), and it holds 1.35x as many tokens. Per-tensor
 `fp8` is 5x worse (KL 0.029, 127/128 top-1) because the checkpoint has no KV scales. vLLM's Triton attention is slow
 on prefill with 8-bit KV, so for prefill chunks the plugin dequantizes the sequence's KV blocks into a persistent fp16
-buffer (`exl3rocm/kv_dequant.py`) and runs the fp16 kernel on them. Decode reads int8 directly. Do not set
-`PYTORCH_HIP_ALLOC_CONF=expandable_segments:True`: it caused a GPU memory-access fault here.
+buffer (`exl3rocm/kv_dequant.py`) and runs the fp16 kernel on them. Decode reads int8 directly.
+That prefill call also gets its own tiling. For head size 256 the image gives gfx1201 a decode-oriented
+`BLOCK_M` of 16, which with 6 query heads per KV head is 2 query tokens per program, so each 816-token chunk
+re-reads its context ~400 times. The plugin sets `BLOCK_M` 128, 8 warps and 2 stages around the prefill call
+only. That makes the kernel 2.2x faster at 16–32k context with bit-identical output, and whole prefills
+1.11x faster at 16k, 1.2x at 32k and 1.34x at 61k (int8 and int4), with decode unchanged.
+`EXL3_PREFILL_TILING=0` turns it off (experiments/0027).
+
+Do not set `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True`: it caused a GPU memory-access fault here.
 
 **4-bit KV cache** (`--kv-cache-dtype int4_per_token_head`, profiles `48k-int4` / `64k-int4` in `serve.sh`). It
 takes half the bytes of int8. Because the GDN state pages cost the same, a KV page holds 1,616 tokens instead of 816.
@@ -132,7 +142,9 @@ groups, so no copy is kept (−0.2 GiB). Qwen3.5's rotary cache is clamped to ma
 of 262,144 (−0.1 GiB; `EXL3_ROPE_CLAMP=0` disables it), and the logits are bit-identical.
 `tests/mem_account.py` breaks down a loaded engine's memory.
 
-Prefill is GEMM-bound at short contexts (`hgemm_recon` ~136 TFLOPS) and attention-bound at long ones. Decode with
+Prefill is GEMM-bound: at 16k tokens the fp16 GEMMs after EXL3 reconstruction take 54% of GPU time
+(`hgemm_recon` ~136 TFLOPS), reconstruction 12%, attention 19% before the tiling above (~10% after, estimated), and all
+GDN kernels together ~3%. Decode with
 MTP stays at 84–95 tok/s with 5–12k-token contexts and ~60 tok/s near 40k. vLLM 0.28 cannot switch speculation
 off by batch size (`disable_by_batch_size` is not in V1), so there are two profiles.
 

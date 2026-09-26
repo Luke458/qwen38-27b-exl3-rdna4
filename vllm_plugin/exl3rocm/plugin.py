@@ -620,7 +620,7 @@ def _install_pth_prefill_dequant():
             return orig(*args, **kw)
         used = bt[:, :nb]
         flat = used.reshape(-1)
-        from .kv_dequant import gather_dequant
+        from .kv_dequant import gather_dequant, prefill_attention
         kd = gather_dequant(k, ks, flat, hs, q.dtype, "k", cap=bt.numel())
         vd = gather_dequant(v, vs, flat, hs, q.dtype, "v", cap=bt.numel())
         key = (q.device, kd.shape[2])
@@ -630,7 +630,7 @@ def _install_pth_prefill_dequant():
         kw = dict(kw, k=kd, v=vd, kv_quant_mode=KVQuantMode.NONE, k_scale_cache=None, v_scale_cache=None,
                   k_descale=desc, v_descale=desc,
                   block_table=torch.arange(flat.numel(), device=bt.device, dtype=bt.dtype).view(used.shape))
-        return orig(**kw)
+        return prefill_attention(orig, **kw)
 
     ta.unified_attention = unified_attention
     ta._exl3_pth_prefill = True

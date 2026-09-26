@@ -18,8 +18,8 @@ distributed here.
 | multi-user / long context | 64k | 42 tok/s single stream, **~200 tok/s** total at 8 streams | int8 KV cache |
 | R9700 32 GB, long context (MTP-3) | 128k / 262k | expected ~80 tok/s at short context | sized, not yet run on a 32 GB card |
 
-All profiles load the vision tower. Prompt processing runs at about 1.5–1.6k tok/s, ~1k tok/s near 32k tokens and
-~0.8k tok/s near 60k. Measured on 2026-09-26; details are in the [plugin README](vllm_plugin/README.md).
+All profiles load the vision tower. Prompt processing runs at about 1.5k tok/s, ~1.3k tok/s near 30k tokens and
+~1.1k tok/s near 60k. Measured on 2026-09-26/27; details are in the [plugin README](vllm_plugin/README.md).
 
 This is an experimental, narrowly tested setup: one card, one checkpoint, one GPU.
 
@@ -48,7 +48,8 @@ uvx --from huggingface_hub hf download GestaltLabs/Qwen3.8-27B-EXL3-11.5GB \
 The build prints `source tree matches the tested build` when the fork pin and patches are the ones
 that were measured. `serve.sh` checks VRAM headroom, then starts the server. Set `MODEL_DIR` or `EXL3_EXT_DIR`
 if the model or the extension is somewhere other than the paths above. The first start compiles and
-captures graphs for a few minutes; later starts reuse `~/.cache/vllm-rdna4-exl3`.
+captures graphs for a few minutes; later starts reuse the compiled graphs and Triton kernels in
+`~/.cache/vllm-rdna4-exl3` and are about a minute faster.
 
 When the log shows `Application startup complete`, the endpoint is **`http://127.0.0.1:8000/v1`** with
 model ID **`qwen38-27b-exl3`** (loopback only, no API key):
