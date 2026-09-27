@@ -778,12 +778,21 @@ def _install_debug_graph_timing():
     torch.cuda.CUDAGraph.replay = replay
 
 
+def _rebind_imported(name, orig, new):
+    """Point vLLM modules that imported `name` by value (`from x import name`) at `new`. Reads module
+    __dict__s instead of getattr: transformers' lazy alias modules answer any getattr with a deprecation
+    notice, which printed ~800 "[transformers] Accessing ..." lines at every startup."""
+    import sys
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name.startswith("vllm") and getattr(mod, "__dict__", {}).get(name) is orig:
+            setattr(mod, name, new)
+
+
 def _install_rope_clamp():
     """Qwen3.5 sizes its rotary cos/sin cache by config.max_position_embeddings (262,144 rows,
     0.125 GiB) whatever max_model_len is. For plain rope and mrope ("default" rope type, no
     dual-chunk attention) the cache is only indexed by position, and positions stay below the
     sequence length, so clamp it to max_model_len plus a margin. Scaled rope types are untouched."""
-    import sys
     from vllm.config import get_current_vllm_config_or_none
     from vllm.model_executor.layers import rotary_embedding
     orig = rotary_embedding.get_rope
@@ -804,9 +813,7 @@ def _install_rope_clamp():
     get_rope._exl3_clamped = True
     rotary_embedding.get_rope = get_rope
     # model modules imported before this hook hold their own reference
-    for mod in list(sys.modules.values()):
-        if getattr(mod, "get_rope", None) is orig and mod is not rotary_embedding:
-            mod.get_rope = get_rope
+    _rebind_imported("get_rope", orig, get_rope)
 
 
 def _install_kv_headroom_check():
@@ -816,7 +823,6 @@ def _install_kv_headroom_check():
     max_model_len 32768 and a 1.65 GB pool, a 31.5k-token prompt stalled forever at 94.6% KV
     usage with nothing to preempt (experiments/0023). Warn at startup when the pool leaves fewer
     than _KV_HEADROOM_BLOCKS spare pages, with the KV size or context length that would fit."""
-    import sys
     from vllm.v1.core import kv_cache_utils
     orig = kv_cache_utils.update_kv_cache_capacity
     if getattr(orig, "_exl3_wrapped", False):
@@ -852,9 +858,7 @@ def _install_kv_headroom_check():
 
     update_kv_cache_capacity._exl3_wrapped = True
     kv_cache_utils.update_kv_cache_capacity = update_kv_cache_capacity
-    for mod in list(sys.modules.values()):
-        if getattr(mod, "update_kv_cache_capacity", None) is orig and mod is not kv_cache_utils:
-            mod.update_kv_cache_capacity = update_kv_cache_capacity
+    _rebind_imported("update_kv_cache_capacity", orig, update_kv_cache_capacity)
 
 
 _KV_HEADROOM_BLOCKS = 3  # tested: 3 spare served a 32,344-token prompt at max_model_len 32768; 0 stalled
